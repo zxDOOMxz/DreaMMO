@@ -114,3 +114,33 @@ def execute(query: str, *args):
         raise e
     finally:
         release_db_connection(conn)
+
+
+def execute_sql_file(file_path: str):
+    """
+    Выполнить SQL файл (для инициализации схемы БД).
+    
+    Пример:
+        execute_sql_file('backend/database/schema.sql')
+    """
+    conn = get_db_connection()
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            sql_script = f.read()
+        
+        with conn.cursor() as cur:
+            # Выполнить скрипт целиком
+            cur.execute(sql_script)
+            conn.commit()
+        
+        print(f"✅ SQL файл {file_path} успешно выполнен")
+        return True
+    except FileNotFoundError:
+        print(f"❌ Файл {file_path} не найден")
+        raise
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Ошибка при выполнении SQL файла: {e}")
+        raise e
+    finally:
+        release_db_connection(conn)

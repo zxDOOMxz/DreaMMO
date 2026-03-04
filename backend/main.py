@@ -4,7 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .config import settings
-from .database.connection import init_db_pool, close_db_pool, fetch_one, execute
+from .database.connection import init_db_pool, close_db_pool, fetch_one, execute, fetch_val
+from .routes import router as game_router
 
 # === Жизненный цикл приложения ===
 @asynccontextmanager
@@ -39,6 +40,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# === Include game routes ===
+app.include_router(game_router)
 
 
 # === Простой health check ===
