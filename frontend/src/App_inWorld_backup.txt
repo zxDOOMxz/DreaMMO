@@ -1,0 +1,729 @@
+  if (inWorld) {
+    return (
+      <div className="app">
+        <header className="header">
+          <div className="header-content">
+            <div className="logo">
+              <h1>Мир Codex Online</h1>
+              <p>{selectedCharacter?.name} - {world?.location?.name}</p>
+            </div>
+            <div className="user-info">
+              <button onClick={handleExitWorld} className="btn-secondary">⬅️ Назад к персонажам</button>
+            </div>
+          </div>
+        </header>
+
+        {error && (
+          <div className="error-banner">
+            <span>{error}</span>
+            <button onClick={() => setError(null)} className="error-close">✕</button>
+          </div>
+        )}
+
+        <div className="container">
+          {/* Movement Status Bar */}
+          {movement.is_moving && (
+            <section className="card" style={{background: '#2a4a2a', border: '2px solid #4CAF50'}}>
+              <div className="card-header">
+                <h2>🏃 Движение к цели</h2>
+              </div>
+              <div className="card-content">
+                <table className="stats-table">
+                  <tbody>
+                    <tr>
+                      <td><strong>Цель:</strong></td>
+                      <td>{movement.target_name}</td>
+                    </tr>
+                    <tr>
+                      <td><strong>Расстояние:</strong></td>
+                      <td>{movement.distance_remaining.toFixed(1)} метров</td>
+                    </tr>
+                    <tr>
+                      <td><strong>Прибытие через:</strong></td>
+                      <td>{movement.eta_seconds.toFixed(0)} секунд</td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div style={{marginTop: '10px', background: '#1a1a1a', borderRadius: '4px', overflow: 'hidden'}}>
+                  <div style={{
+                    width: `${Math.max(5, 100 - (movement.distance_remaining / (movement.distance_remaining + movement.eta_seconds * 5) * 100))}%`,
+                    height: '20px',
+                    background: 'linear-gradient(90deg, #4CAF50, #81C784)',
+                    transition: 'width 1s linear'
+                  }}></div>
+                </div>
+              </div>
+            </section>
+          )}
+
+          {/* Zones and NPCs Table */}
+          <section className="card">
+            <div className="card-header">
+              <h2>🗺️ Зоны и объекты</h2>
+              <button onClick={loadLocationZones} className="btn-icon">🔄</button>
+            </div>
+            <div className="card-content">
+              <table className="objects-table">
+                <thead>
+                  <tr>
+                    <th>Название</th>
+                    <th>Тип</th>
+                    <th>Расстояние (м)</th>
+                    <th>Уровни</th>
+                    <th>Действия</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {zones.map((zone) => (
+                    <React.Fragment key={`zone-${zone.zone_id}`}>
+                      <tr style={{background: zone.is_aggressive ? '#3a2a2a' : '#2a2a3a'}}>
+                        <td><strong>{zone.name}</strong></td>
+                        <td>{zone.is_aggressive ? '⚔️ АГР' : '🌿 ПАС'}</td>
+                        <td>{zone.distance}</td>
+                        <td>{zone.level_range}</td>
+                        <td>
+                          {zone.can_interact ? (
+                            <button 
+                              className="btn-small btn-success" 
+                              onClick={() => interactWithObject('zone', zone.zone_id, 'enter')}
+                            >
+                              Войти
+                            </button>
+                          ) : (
+                            <button 
+                              className="btn-small" 
+                              onClick={() => startMovement('zone', zone.zone_id, zone.name)}
+                            >
+                              Идти ({zone.distance}м)
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                      {zone.mobs && zone.mobs.map((mob, idx) => (
+                        <tr key={`mob-${zone.zone_id}-${idx}`} style={{background: '#1a1a1a', fontSize: '0.9em'}}>
+                          <td style={{paddingLeft: '30px'}}>└─ {mob.name}</td>
+                          <td>{mob.level} lvl ({mob.aggression})</td>
+                          <td></td>
+                          <td>{mob.stars > 0 ? `${'⭐'.repeat(mob.stars)} Чемпион` : ''}</td>
+                          <td>
+                            {zone.can_interact && (
+                              <button 
+                                className="btn-small btn-danger" 
+                                onClick={() => attackMob(mob.id)}
+                              >
+                                Атаковать
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </React.Fragment>
+                  ))}
+                  
+                  {npcsInLocation.map((npc) => {
+                    // Определяем иконку и цвет для разных типов
+                    let npcIcon = '👨‍💼';
+                    let bgColor = '#2a3a2a';
+                    if (npc.type === 'merchant') { npcIcon = '🏪'; bgColor = '#3a2a3a'; }
+                    else if (npc.type === 'broker') { npcIcon = '💰'; bgColor = '#3a2a2a'; }
+                    else if (npc.type === 'tree') { npcIcon = '🌲'; bgColor = '#2a3a2a'; }
+                    else if (npc.type === 'ore') { npcIcon = '⛏️'; bgColor = '#3a2a2a'; }
+                    else if (npc.type === 'herb') { npcIcon = '🌿'; bgColor = '#2a3a2a'; }
+                    
+                    return (
+                      <tr key={`npc-${npc.npc_id}`} style={{background: bgColor}}>
+                        <td><strong>{npcIcon} {npc.name}</strong></td>
+                        <td>{npc.type === 'quest_giver' ? 'Квестодатель' : 
+                            npc.type === 'merchant' ? 'Торговец' :
+                            npc.type === 'broker' ? 'Брокер' :
+                            npc.type === 'tree' ? 'Дерево' :
+                            npc.type === 'ore' ? 'Руда' :
+                            npc.type === 'herb' ? 'Трава' : npc.type}</td>
+                        <td>{npc.distance}</td>
+                        <td>{npc.level} lvl</td>
+                        <td>
+                          {npc.can_interact ? (
+                            <div style={{display: 'flex', gap: '5px', flexWrap: 'wrap'}}>
+                              {npc.type === 'tree' || npc.type === 'ore' || npc.type === 'herb' ? (
+                                <button 
+                                  className="btn-small btn-success"
+                                  onClick={() => interactWithObject('npc', npc.npc_id, 'gather')}
+                                >
+                                  {npc.type === 'tree' ? '🪓 Срубить' : npc.type === 'ore' ? '⛏️ Добыть' : '🌿 Собрать'}
+                                </button>
+                              ) : (
+                                npc.interaction_options.map((opt, idx) => (
+                                  <button 
+                                    key={idx}
+                                    className="btn-small" 
+                                    onClick={() => {
+                                      if (opt === 'Квесты') interactWithObject('npc', npc.npc_id, 'quest');
+                                      else if (opt === 'Сдать квест') interactWithObject('npc', npc.npc_id, 'turn_in_quest');
+                                      else if (opt === 'Купить') interactWithObject('npc', npc.npc_id, 'buy');
+                                      else if (opt === 'Продать') interactWithObject('npc', npc.npc_id, 'sell');
+                                      else if (opt === 'Аукцион') interactWithObject('npc', npc.npc_id, 'auction');
+                                    }}
+                                  >
+                                    {opt}
+                                  </button>
+                                ))
+                              )}
+                            </div>
+                          ) : (
+                            <button 
+                              className="btn-small" 
+                              onClick={() => startMovement('npc', npc.npc_id, npc.name)}
+                            >
+                              Идти ({npc.distance}м)
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  
+                  {zones.length === 0 && npcsInLocation.length === 0 && (
+                    <tr>
+                      <td colSpan="5" className="no-data">Нет объектов. Нажмите обновить.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          {/* Combat Log */}
+          {combatLog.length > 0 && (
+            <section className="card">
+              <div className="card-header">
+                <h2>⚔️ Боевой лог</h2>
+                <button onClick={() => setCombatLog([])} className="btn-small btn-danger">Очистить</button>
+              </div>
+              <div className="card-content" style={{maxHeight: '300px', overflowY: 'auto'}}>
+                {combatLog.map((msg, idx) => (
+                  <div key={idx} style={{
+                    padding: '5px 10px',
+                    margin: '5px 0',
+                    background: '#1a1a1a',
+                    borderLeft: msg.includes('КРИТИЧЕСКИЙ') ? '3px solid #f44336' : 
+                                 msg.includes('промахнулся') ? '3px solid #999' :
+                                 msg.includes('повержен') ? '3px solid #4CAF50' : '3px solid #2196F3',
+                    borderRadius: '4px',
+                    fontSize: '0.9em'
+                  }}>
+                    {msg}
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {/* Combat Stats Panel */}
+          {combatStats && (
+            <section className="card">
+              <div className="card-header">
+                <h2>📊 Боевые характеристики</h2>
+                <button onClick={loadCombatStats} className="btn-icon">🔄</button>
+              </div>
+              <div className="card-content">
+                <table className="stats-table">
+                  <tbody>
+                    <tr>
+                      <td><strong>Урон:</strong></td>
+                      <td>{combatStats.combat.damage_min} - {combatStats.combat.damage_max}</td>
+                    </tr>
+                    <tr>
+                      <td><strong>Шанс попадания:</strong></td>
+                      <td>{combatStats.combat.hit_chance}%</td>
+                    </tr>
+                    <tr>
+                      <td><strong>Шанс крита:</strong></td>
+                      <td>{combatStats.combat.crit_chance}%</td>
+                    </tr>
+                    <tr>
+                      <td><strong>Шанс блока:</strong></td>
+                      <td>{combatStats.combat.block_chance}%</td>
+                    </tr>
+                    <tr>
+                      <td><strong>Скорость атаки:</strong></td>
+                      <td>{combatStats.combat.attack_speed} атак/мин</td>
+                    </tr>
+                    <tr>
+                      <td><strong>Броня:</strong></td>
+                      <td>{combatStats.combat.armor_value}</td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div style={{marginTop: '15px', padding: '10px', background: '#1a1a1a', borderRadius: '4px'}}>
+                  <div style={{fontSize: '0.85em', color: '#aaa'}}>
+                    <div>💪 Сила: {combatStats.stats.strength} | 🏃 Ловкость: {combatStats.stats.dexterity}</div>
+                    <div>🛡️ Выносливость: {combatStats.stats.constitution} | 🎲 Удача: {combatStats.stats.luck}</div>
+                  </div>
+                </div>
+              </div>
+            </section>
+          )}
+
+          {/* Party Panel */}
+          <section className="card">
+            <div className="card-header">
+              <h2>👥 Группа</h2>
+            </div>
+            <div className="card-content">
+              {!partyInfo ? (
+                <div>
+                  <p style={{marginBottom: '15px', color: '#aaa'}}>Вы не в группе</p>
+                  <button 
+                    className="btn btn-primary" 
+                    onClick={() => createParty(`Группа ${selectedCharacter?.name}`)}
+                    style={{width: '100%'}}
+                  >
+                    Создать группу
+                  </button>
+                  
+                  {/* Nearby Players List */}
+                  {nearbyPlayers.length > 0 && (
+                    <div style={{marginTop: '20px'}}>
+                      <h4 style={{marginBottom: '10px', color: '#aaa'}}>Игроки поблизости:</h4>
+                      <div style={{fontSize: '0.85em', color: '#666', marginBottom: '10px'}}>
+                        💡 Создайте группу, чтобы приглашать игроков
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div>
+                  <h3 style={{marginBottom: '10px'}}>{partyInfo.party_name}</h3>
+                  <p style={{marginBottom: '15px', color: '#aaa'}}>Лидер: {partyInfo.leader.name} | Участников: {partyInfo.current_members}/{partyInfo.max_members}</p>
+                  <div style={{display: 'flex', flexDirection: 'column', gap: '10px', marginBottom: '15px'}}>
+                    {partyInfo.members.map((member) => {
+                      const hpPercent = (member.hp / member.max_hp) * 100;
+                      const mpPercent = member.max_mp > 0 ? (member.mp / member.max_mp) * 100 : 0;
+                      return (
+                        <div key={member.character_id} style={{
+                          padding: '10px',
+                          background: '#1a1a1a',
+                          borderRadius: '4px',
+                          border: '1px solid #333'
+                        }}>
+                          <div style={{display: 'flex', justifyContent: 'space-between', marginBottom: '8px'}}>
+                            <span>
+                              {member.role === 'leader' ? '👑 ' : ''}
+                              <strong>{member.name}</strong>
+                            </span>
+                            <span style={{color: '#aaa'}}>Lvl {member.level}</span>
+                          </div>
+                          {/* HP Bar */}
+                          <div style={{marginBottom: '5px'}}>
+                            <div style={{display: 'flex', justifyContent: 'space-between', fontSize: '0.85em', marginBottom: '3px'}}>
+                              <span style={{color: '#f44336'}}>❤️ HP</span>
+                              <span>{member.hp}/{member.max_hp}</span>
+                            </div>
+                            <div style={{
+                              width: '100%',
+                              height: '12px',
+                              background: '#222',
+                              borderRadius: '6px',
+                              overflow: 'hidden',
+                              border: '1px solid #333'
+                            }}>
+                              <div style={{
+                                width: `${hpPercent}%`,
+                                height: '100%',
+                                background: hpPercent > 50 ? '#4CAF50' : hpPercent > 25 ? '#FFC107' : '#f44336',
+                                transition: 'width 0.3s ease'
+                              }}></div>
+                            </div>
+                          </div>
+                          {/* MP Bar */}
+                          {member.max_mp > 0 && (
+                            <div>
+                              <div style={{display: 'flex', justifyContent: 'space-between', fontSize: '0.85em', marginBottom: '3px'}}>
+                                <span style={{color: '#2196F3'}}>💧 MP</span>
+                                <span>{member.mp}/{member.max_mp}</span>
+                              </div>
+                              <div style={{
+                                width: '100%',
+                                height: '12px',
+                                background: '#222',
+                                borderRadius: '6px',
+                                overflow: 'hidden',
+                                border: '1px solid #333'
+                              }}>
+                                <div style={{
+                                  width: `${mpPercent}%`,
+                                  height: '100%',
+                                  background: '#2196F3',
+                                  transition: 'width 0.3s ease'
+                                }}></div>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  
+                  {/* Nearby Players for Inviting (Leader only) */}
+                  {partyInfo.leader.id === selectedCharId && nearbyPlayers.filter(p => !p.in_party).length > 0 && (
+                    <div style={{marginTop: '20px', paddingTop: '15px', borderTop: '1px solid #333'}}>
+                      <h4 style={{marginBottom: '10px'}}>Пригласить в группу:</h4>
+                      <div style={{display: 'flex', flexDirection: 'column', gap: '8px'}}>
+                        {nearbyPlayers.filter(p => !p.in_party).map((player) => (
+                          <div key={player.character_id} style={{
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            alignItems: 'center',
+                            padding: '8px',
+                            background: '#1a1a1a',
+                            borderRadius: '4px',
+                            border: '1px solid #333'
+                          }}>
+                            <div>
+                              <strong>{player.name}</strong>
+                              <div style={{fontSize: '0.85em', color: '#aaa'}}>
+                                Lvl {player.level} • {player.race} {player.class}
+                              </div>
+                            </div>
+                            <button 
+                              className="btn-small btn-primary"
+                              onClick={() => inviteToParty(player.character_id, player.name)}
+                            >
+                              Пригласить
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  
+                  <button 
+                    className="btn btn-danger" 
+                    onClick={leaveParty}
+                    style={{width: '100%', marginTop: '15px'}}
+                  >
+                    Покинуть группу
+                  </button>
+                </div>
+              )}
+            </div>
+          </section>
+
+          {/* Zone Objects - OLD (keep for compatibility) */}
+          <section className="card" style={{display: 'none'}}>
+            <div className="card-header">
+              <h2>👁️ Объекты зоны (OLD)</h2>
+            </div>
+            <div className="card-content">
+              <table className="objects-table">
+                <thead>
+                  <tr>
+                    <th>Тип</th>
+                    <th>Название</th>
+                    <th>Расстояние</th>
+                    <th>Действие</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {zoneObjects.map((obj) => (
+                    <tr key={obj.id}>
+                      <td>{obj.type === 'character' ? '👤' : obj.type === 'building' ? '🏠' : '👨‍💼'}</td>
+                      <td>{obj.name}</td>
+                      <td>{obj.distance_m}m</td>
+                      <td>
+                        <button className="btn-small">{obj.interaction || 'Взаимодействовать'}</button>
+                      </td>
+                    </tr>
+                  ))}
+                  {zoneObjects.length === 0 && (
+                    <tr>
+                      <td colSpan="4" className="no-data">Нет объектов в зоне видимости</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          {/* Mobs - OLD (keep for compatibility) */}
+          <section className="card" style={{display: 'none'}}>
+            <div className="card-header">
+              <h2>🐺 Монстры (OLD)</h2>
+            </div>
+            <div className="card-content">
+              <table className="objects-table">
+                <thead>
+                  <tr>
+                    <th>Уровень</th>
+                    <th>Название</th>
+                    <th>Здоровье</th>
+                    <th>Урон</th>
+                    <th>Действие</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {mobs.map((mob) => (
+                    <tr key={mob.id}>
+                      <td>{mob.level}</td>
+                      <td>{mob.name}</td>
+                      <td>{mob.health}/{mob.max_health}</td>
+                      <td>{mob.damage_min}-{mob.damage_max}</td>
+                      <td>
+                        <button 
+                          className="btn-small btn-danger"
+                          onClick={() => startCombat(mob.id)}
+                          disabled={currentCombat !== null}
+                        >
+                          ⚔️ Атаковать
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {mobs.length === 0 && (
+                    <tr>
+                      <td colSpan="5" className="no-data">Нет монстров в этой локации</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          {/* Quests Available */}
+          <section className="card">
+            <div className="card-header">
+              <h2>📜 Доступные Квесты</h2>
+            </div>
+            <div className="card-content">
+              {availableQuests.length === 0 ? (
+                <p>Нет доступных квестов в этой локации</p>
+              ) : (
+                <div className="quests-list">
+                  {availableQuests.map((quest) => (
+                    <div key={quest.id} className="quest-card">
+                      <div className="quest-info">
+                        <h4>{quest.title}</h4>
+                        <p>{quest.description}</p>
+                        <div className="quest-rewards">
+                          <span>⭐ Опыт: {quest.reward_experience}</span>
+                          <span>💰 Золото: {quest.reward_gold}</span>
+                        </div>
+                      </div>
+                      <button 
+                        className="btn btn-success"
+                        onClick={() => acceptQuest(quest.id)}
+                        disabled={quest.is_active}
+                      >
+                        {quest.is_active ? '✓ Активен' : 'Принять'}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </section>
+
+          {/* Active Quests */}
+          <section className="card">
+            <div className="card-header">
+              <h2>📖 Активные Квесты</h2>
+            </div>
+            <div className="card-content">
+              {activeQuests.length === 0 ? (
+                <p>Нет активных квестов</p>
+              ) : (
+                <div className="quests-list">
+                  {activeQuests.map((quest) => (
+                    <div key={quest.quest_id} className="quest-card active">
+                      <div className="quest-info">
+                        <h4>{quest.title}</h4>
+                        <p>{quest.description}</p>
+                        {quest.kill_targets && quest.kill_targets.length > 0 && (
+                          <div className="quest-progress">
+                            <strong>Цели:</strong>
+                            {quest.kill_targets.map((target) => (
+                              <div key={target.mob_id} className="progress-item">
+                                🎯 {target.mob_name}: убить {target.required_count}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <button 
+                        className="btn btn-success"
+                        onClick={() => completeQuest(quest.quest_id)}
+                      >
+                        Завершить
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </section>
+
+          {/* Stats & Skills */}
+          <section className="card">
+            <div className="card-header">
+              <h2>💎 Коины & Умений | 🔪 Разделка</h2>
+            </div>
+            <div className="card-content stats-grid">
+              <div className="stat-item">
+                <span className="stat-label">Коины Умений:</span>
+                <span className="stat-value" style={{color: '#6366f1'}}>{skillCoins} 💎</span>
+              </div>
+              <div className="stat-item">
+                <span className="stat-label">Разделка Ур:</span>
+                <span className="stat-value" style={{color: '#10b981'}}>{butcheringSkill.skill_level} 🔪</span>
+              </div>
+              <div className="stat-item">
+                <span className="stat-label">Опыт разделки:</span>
+                <span className="stat-value">{butcheringSkill.experience}/100</span>
+              </div>
+              <div className="stat-item">
+                <span className="stat-label">Разобрано:</span>
+                <span className="stat-value">{butcheringSkill.items_butchered} 🐺</span>
+              </div>
+            </div>
+          </section>
+
+          {/* Combat Area */}
+          <section className="card">
+            <div className="card-header">
+              <h2>⚔️ Зона боя</h2>
+            </div>
+            <div className="card-content combat-area">
+              {currentCombat ? (
+                <div className="combat-active">
+                  <div className="combat-header">
+                    <div className="combatant">
+                      <div className="name">{selectedCharacter?.name}</div>
+                      <div className="health-bar">
+                        <div 
+                          className="health-fill" 
+                          style={{width: `${(currentCombat.character_health / (selectedCharacter?.max_health_points || 100)) * 100}%`}}
+                        ></div>
+                        <span className="health-text">{currentCombat.character_health}/{selectedCharacter?.max_health_points || 100}</span>
+                      </div>
+                    </div>
+                    <div className="vs">VS</div>
+                    <div className="combatant">
+                      <div className="name">{currentCombat.mob.name}</div>
+                      <div className="health-bar">
+                        <div 
+                          className="health-fill enemy" 
+                          style={{width: `${(currentCombat.mob_health / currentCombat.mob.max_health) * 100}%`}}
+                        ></div>
+                        <span className="health-text">{currentCombat.mob_health}/{currentCombat.mob.max_health}</span>
+                      </div>
+                    </div>
+                  </div>
+                  
+                  <div className="combat-log">
+                    {combatLog.slice(-5).map((log, index) => (
+                      <div key={index} className="log-entry">{log}</div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <p>Выберите монстра для начала боя...</p>
+              )}
+            </div>
+          </section>
+
+          {/* Actions */}
+          <section className="card">
+            <div className="card-header">
+              <h2>🎯 Действия</h2>
+            </div>
+            <div className="card-content actions-panel">
+              <div className="abilities-section">
+                <h4>Умения:</h4>
+                <div className="abilities-grid">
+                  {characterAbilities.filter(a => a.type === 'skill').map((ability) => (
+                    <button 
+                      key={ability.id}
+                      className="btn-action"
+                      onClick={() => useAbility(ability.id)}
+                      disabled={currentCombat === null || ability.cooldown_remaining > 0}
+                    >
+                      ⚡ {ability.name}<br/>
+                      <small>{ability.mana_cost} маны</small>
+                    </button>
+                  ))}
+                </div>
+              </div>
+              
+              <div className="abilities-section">
+                <h4>Заклинания:</h4>
+                <div className="abilities-grid">
+                  {characterAbilities.filter(a => a.type === 'spell').map((ability) => (
+                    <button 
+                      key={ability.id}
+                      className="btn-action"
+                      onClick={() => useAbility(ability.id)}
+                      disabled={currentCombat === null || ability.cooldown_remaining > 0}
+                    >
+                      🔮 {ability.name}<br/>
+                      <small>{ability.mana_cost} маны</small>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        {/* Invitation Sent Modal */}
+        {showInviteSentModal && (
+          <div className="modal-overlay" onClick={() => setShowInviteSentModal(false)}>
+            <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+              <h3>✓ Приглашение отправлено</h3>
+              <p style={{marginTop: '15px', marginBottom: '20px'}}>
+                Игрок <strong>{inviteSentTo}</strong> получил приглашение в группу
+              </p>
+              <button 
+                className="btn btn-primary" 
+                onClick={() => setShowInviteSentModal(false)}
+                style={{width: '100%'}}
+              >
+                OK
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Invitation Received Modal */}
+        {showInviteReceivedModal && currentInvitation && (
+          <div className="modal-overlay">
+            <div className="modal-content">
+              <h3>📨 Приглашение в группу</h3>
+              <p style={{marginTop: '15px', marginBottom: '20px'}}>
+                Игрок <strong>{currentInvitation.inviter_name}</strong> (Lvl {currentInvitation.inviter_level}) 
+                приглашает вас в группу <strong>{currentInvitation.party_name}</strong>
+              </p>
+              <div style={{display: 'flex', gap: '10px'}}>
+                <button 
+                  className="btn btn-success" 
+                  onClick={() => acceptInvitation(currentInvitation.invitation_id)}
+                  style={{flex: 1}}
+                >
+                  Принять
+                </button>
+                <button 
+                  className="btn btn-secondary" 
+                  onClick={() => rejectInvitation(currentInvitation.invitation_id)}
+                  style={{flex: 1}}
+                >
+                  Отклонить
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="app">

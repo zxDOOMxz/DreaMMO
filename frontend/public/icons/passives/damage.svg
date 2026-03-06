@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 40 40" fill="none">
+  <rect width="40" height="40" rx="10" fill="#1F2937"/>
+  <path d="M22 8L12 23H19L17 32L28 17H21L22 8Z" fill="#F87171"/>
+  <text x="20" y="35" text-anchor="middle" fill="#FCA5A5" font-size="8" font-family="Arial" font-weight="700">DMG</text>
+</svg>

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 40 40" fill="none">
+  <rect width="40" height="40" rx="10" fill="#1F2937"/>
+  <path d="M20 7L30 11V19C30 25 26.5 30.3 20 33C13.5 30.3 10 25 10 19V11L20 7Z" fill="#60A5FA"/>
+  <text x="20" y="23" text-anchor="middle" fill="#0B1020" font-size="9" font-family="Arial" font-weight="700">DEF</text>
+</svg>

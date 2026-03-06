@@ -2,15 +2,23 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
+# if .env missing, create from example so config can load
+dotenv_path = Path(__file__).parent / ".env"
+example_path = Path(__file__).parent / ".env.example"
+if not dotenv_path.exists() and example_path.exists():
+    with open(example_path, 'r', encoding='utf-8') as src, open(dotenv_path, 'w', encoding='utf-8') as dst:
+        dst.write(src.read())
+    print("⚠️  .env файл не найден, создан из .env.example. Пожалуйста, отредактируйте его и добавьте DATABASE_URL.")
+
 # Загрузка переменных из .env файла
-load_dotenv(Path(__file__).parent / ".env")
+# если файл не существует, load_dotenv тихо ничего не делает
+load_dotenv(dotenv_path)
 
 class Settings:
     # === DATABASE ===
+    # сначала читаем из окружения, потом из .env
     DATABASE_URL: str = os.getenv("DATABASE_URL", "")
-    
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL не найден в .env файле!")
+    DATABASE_AVAILABLE: bool = bool(DATABASE_URL)
     
     # === JWT (авторизация) ===
     JWT_SECRET: str = os.getenv("JWT_SECRET", "change_this_in_production")
@@ -25,7 +33,7 @@ class Settings:
     DEBUG: bool = os.getenv("DEBUG", "True").lower() in ("true", "1", "yes")
     
     # === APP ===
-    APP_NAME: str = "DreaMMO API"
+    APP_NAME: str = "Codex Online API"
     APP_VERSION: str = "0.1.0"
     
     # === CORS (для frontend) ===

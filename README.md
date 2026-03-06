@@ -47,6 +47,8 @@ See [SETUP.md](SETUP.md) for detailed installation instructions.
 
 ### ⚡ Quick Setup (5 minutes)
 
+> Примечание: в backend появились простые маршруты для регистрации и логина, используйте их для создания пользователей.
+
 ```bash
 # Clone
 git clone https://github.com/zxDOOMxz/DreaMMO.git

@@ -13,17 +13,78 @@ CREATE TABLE IF NOT EXISTS users (
     is_active BOOLEAN DEFAULT TRUE
 );
 
+-- ===== CHARACTER CLASSES =====
+CREATE TABLE IF NOT EXISTS character_classes (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(50) NOT NULL UNIQUE,
+    description TEXT,
+    base_health INTEGER DEFAULT 100,
+    base_mana INTEGER DEFAULT 50,
+    health_per_level INTEGER DEFAULT 10,
+    mana_per_level INTEGER DEFAULT 5,
+    primary_stat VARCHAR(20),             -- strength, intelligence, dexterity
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ===== ABILITIES (умения и заклинания) =====
+CREATE TABLE IF NOT EXISTS abilities (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    description TEXT,
+    ability_type VARCHAR(20),             -- spell, skill, passive
+    class_id INTEGER REFERENCES character_classes(id) ON DELETE CASCADE,
+    level_requirement INTEGER DEFAULT 1,
+    mana_cost INTEGER DEFAULT 0,
+    cooldown INTEGER DEFAULT 0,           -- в секундах
+    damage_min INTEGER DEFAULT 0,
+    damage_max INTEGER DEFAULT 0,
+    healing INTEGER DEFAULT 0,
+    effect_type VARCHAR(50),              -- damage, heal, buff, debuff
+    effect_duration INTEGER DEFAULT 0,    -- в секундах
+    range_m INTEGER DEFAULT 1,            -- дальность действия
+    is_aoe BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ===== RACES (Расы) =====
+CREATE TABLE IF NOT EXISTS races (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(50) NOT NULL UNIQUE,
+    description TEXT,
+    strength_bonus INTEGER DEFAULT 0,
+    dexterity_bonus INTEGER DEFAULT 0,
+    constitution_bonus INTEGER DEFAULT 0,
+    intelligence_bonus INTEGER DEFAULT 0,
+    wisdom_bonus INTEGER DEFAULT 0,
+    luck_bonus INTEGER DEFAULT 0,
+    health_bonus INTEGER DEFAULT 0,
+    mana_bonus INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ===== RACE PASSIVE ABILITIES (Пассивные навыки рас) =====
+CREATE TABLE IF NOT EXISTS race_passive_abilities (
+    id SERIAL PRIMARY KEY,
+    race_id INTEGER NOT NULL REFERENCES races(id) ON DELETE CASCADE,
+    ability_id INTEGER NOT NULL REFERENCES abilities(id) ON DELETE CASCADE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(race_id, ability_id)
+);
+
 -- ===== CHARACTERS =====
 CREATE TABLE IF NOT EXISTS characters (
     id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name VARCHAR(50) UNIQUE NOT NULL,
+    race_id INTEGER REFERENCES races(id) ON DELETE SET NULL,
+    class_id INTEGER REFERENCES character_classes(id) ON DELETE SET NULL,
     level INTEGER DEFAULT 1,
     experience INTEGER DEFAULT 0,
     health_points INTEGER DEFAULT 100,
     max_health_points INTEGER DEFAULT 100,
     mana_points INTEGER DEFAULT 50,
     max_mana_points INTEGER DEFAULT 50,
+    gold INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_online TIMESTAMP,
     is_online BOOLEAN DEFAULT FALSE
@@ -74,7 +135,7 @@ CREATE TABLE IF NOT EXISTS location_objects (
 -- ===== NPCs =====
 CREATE TABLE IF NOT EXISTS npcs (
     id SERIAL PRIMARY KEY,
-    location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE SET NULL,
+    location_id INTEGER REFERENCES locations(id) ON DELETE SET NULL,
     name VARCHAR(100) NOT NULL,
     type VARCHAR(50),                     -- merchant, quest_giver, guard, enemy, etc
     level INTEGER DEFAULT 1,
@@ -87,17 +148,48 @@ CREATE TABLE IF NOT EXISTS npcs (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- ===== BUILDINGS =====
-CREATE TABLE IF NOT EXISTS buildings (
+-- ===== CHARACTER ABILITIES =====
+CREATE TABLE IF NOT EXISTS character_abilities (
     id SERIAL PRIMARY KEY,
-    location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+    character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    ability_id INTEGER NOT NULL REFERENCES abilities(id) ON DELETE CASCADE,
+    level INTEGER DEFAULT 1,
+    cooldown_remaining INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(character_id, ability_id)
+);
+
+-- ===== MOBS (монстры) =====
+CREATE TABLE IF NOT EXISTS mobs (
+    id SERIAL PRIMARY KEY,
     name VARCHAR(100) NOT NULL,
-    building_type VARCHAR(50),            -- shop, inn, bank, blacksmith, tavern, etc
-    description TEXT,
-    owner_player_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    can_loot BOOLEAN DEFAULT FALSE,
-    locked BOOLEAN DEFAULT FALSE,
+    level INTEGER DEFAULT 1,
+    health_points INTEGER DEFAULT 50,
+    max_health_points INTEGER DEFAULT 50,
+    damage_min INTEGER DEFAULT 5,
+    damage_max INTEGER DEFAULT 10,
+    armor_class INTEGER DEFAULT 0,
+    experience_reward INTEGER DEFAULT 10,
+    gold_reward INTEGER DEFAULT 5,
+    location_id INTEGER REFERENCES locations(id) ON DELETE CASCADE,
+    mob_type VARCHAR(50),                 -- animal, undead, demon, etc
+    aggression_type VARCHAR(20),          -- passive, aggressive, defensive
+    respawn_time INTEGER DEFAULT 300,     -- в секундах
+    loot_table_id INTEGER,                -- ссылка на таблицу лута
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ===== COMBAT LOG =====
+CREATE TABLE IF NOT EXISTS combat_log (
+    id SERIAL PRIMARY KEY,
+    character_id INTEGER REFERENCES characters(id) ON DELETE CASCADE,
+    mob_id INTEGER REFERENCES mobs(id) ON DELETE CASCADE,
+    action_type VARCHAR(50),              -- attack, spell, skill, defend
+    ability_id INTEGER REFERENCES abilities(id) ON DELETE SET NULL,
+    damage_dealt INTEGER DEFAULT 0,
+    damage_taken INTEGER DEFAULT 0,
+    healing_done INTEGER DEFAULT 0,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- ===== ITEMS (предметы для крафта, боя, использования) =====
@@ -251,7 +343,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 CREATE TABLE IF NOT EXISTS player_status (
     id SERIAL PRIMARY KEY,
     character_id INTEGER NOT NULL UNIQUE REFERENCES characters(id) ON DELETE CASCADE,
-    current_location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE SET NULL,
+    current_location_id INTEGER REFERENCES locations(id) ON DELETE SET NULL,
     status_type VARCHAR(50),              -- idle, in_combat, crafting, gathering, in_quest, etc
     status_data TEXT,                     -- JSON с доп информацией
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -268,14 +360,123 @@ CREATE TABLE IF NOT EXISTS friends (
     CHECK (character_id_1 < character_id_2)
 );
 
+-- ===== LOOT TABLES (Таблицы лутов для мобов) =====
+CREATE TABLE IF NOT EXISTS loot_tables (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    description TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ===== LOOT ITEMS (Предметы в таблице лутов) =====
+CREATE TABLE IF NOT EXISTS loot_items (
+    id SERIAL PRIMARY KEY,
+    loot_table_id INTEGER NOT NULL REFERENCES loot_tables(id) ON DELETE CASCADE,
+    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    drop_chance DECIMAL(5,2) DEFAULT 50.00,  -- Шанс выпадения в процентах
+    min_quantity INTEGER DEFAULT 1,
+    max_quantity INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ===== MOB LOOT (Добытые предметы из мобов) =====
+CREATE TABLE IF NOT EXISTS mob_loot (
+    id SERIAL PRIMARY KEY,
+    character_id INTEGER REFERENCES characters(id) ON DELETE CASCADE,
+    mob_id INTEGER REFERENCES mobs(id) ON DELETE SET NULL,
+    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    quantity INTEGER DEFAULT 1,
+    obtained_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_butchered BOOLEAN DEFAULT FALSE    -- Был ли разработан этот лут
+);
+
+-- ===== BUTCHERING SKILL (Навык разделки) =====
+CREATE TABLE IF NOT EXISTS butchering_skill (
+    id SERIAL PRIMARY KEY,
+    character_id INTEGER NOT NULL UNIQUE REFERENCES characters(id) ON DELETE CASCADE,
+    skill_level INTEGER DEFAULT 1,
+    experience INTEGER DEFAULT 0,         -- Опыт для прокачки разделки
+    experience_next_level INTEGER DEFAULT 100,  -- Опыта нужно до следующего уровня
+    items_butchered INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ===== SKILL COINS (Валюта для покупки умений) =====
+CREATE TABLE IF NOT EXISTS skill_coins (
+    id SERIAL PRIMARY KEY,
+    character_id INTEGER NOT NULL UNIQUE REFERENCES characters(id) ON DELETE CASCADE,
+    balance INTEGER DEFAULT 0,            -- Текущий баланс коинов
+    total_earned INTEGER DEFAULT 0,       -- Всего заработано
+    total_spent INTEGER DEFAULT 0,        -- Всего потрачено
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ===== ABILITY SKILL COIN COSTS (Стоимость умений в коинах) =====
+CREATE TABLE IF NOT EXISTS ability_skill_coin_costs (
+    id SERIAL PRIMARY KEY,
+    ability_id INTEGER NOT NULL UNIQUE REFERENCES abilities(id) ON DELETE CASCADE,
+    skill_coin_cost INTEGER DEFAULT 0,    -- 0 = не продается за коины
+    class_id INTEGER REFERENCES character_classes(id) ON DELETE CASCADE,
+    unlocked_at_level INTEGER DEFAULT 1,  -- На каком уровне доступна для покупки
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ===== CHARACTER LEARNED ABILITIES (Обученные умения через коины) =====
+CREATE TABLE IF NOT EXISTS character_learned_abilities (
+    id SERIAL PRIMARY KEY,
+    character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    ability_id INTEGER NOT NULL REFERENCES abilities(id) ON DELETE CASCADE,
+    learned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(character_id, ability_id)
+);
+
+-- ===== SKILL COIN TRANSACTIONS (История транзакций коинов) =====
+CREATE TABLE IF NOT EXISTS skill_coin_transactions (
+    id SERIAL PRIMARY KEY,
+    character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    transaction_type VARCHAR(50),         -- earned, spent, quest_reward
+    amount INTEGER NOT NULL,
+    source TEXT,                          -- quest_id, ability_id, etc
+    description TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ===== QUEST KILL TARGETS (Целевые мобы для квестов убйства) =====
+CREATE TABLE IF NOT EXISTS quest_kill_targets (
+    id SERIAL PRIMARY KEY,
+    quest_id INTEGER NOT NULL REFERENCES quests(id) ON DELETE CASCADE,
+    mob_id INTEGER NOT NULL REFERENCES mobs(id) ON DELETE CASCADE,
+    required_count INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ===== CHARACTER QUEST KILLS (Отслеживание убитых мобов для квестов) =====
+CREATE TABLE IF NOT EXISTS character_quest_kills (
+    id SERIAL PRIMARY KEY,
+    character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    quest_id INTEGER NOT NULL REFERENCES quests(id) ON DELETE CASCADE,
+    mob_id INTEGER NOT NULL REFERENCES mobs(id) ON DELETE CASCADE,
+    kill_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(character_id, quest_id, mob_id)
+);
+
 -- ===== INDEXES для оптимизации =====
-CREATE INDEX idx_characters_user_id ON characters(user_id);
-CREATE INDEX idx_characters_is_online ON characters(is_online);
-CREATE INDEX idx_location_objects_location_id ON location_objects(location_id);
-CREATE INDEX idx_npcs_location_id ON npcs(location_id);
-CREATE INDEX idx_inventory_character_id ON inventory(character_id);
-CREATE INDEX idx_character_quests_character_id ON character_quests(character_id);
-CREATE INDEX idx_combat_logs_timestamp ON combat_logs(timestamp);
-CREATE INDEX idx_chat_messages_created_at ON chat_messages(created_at);
-CREATE INDEX idx_player_status_character_id ON player_status(character_id);
-CREATE INDEX idx_faction_members_character_id ON faction_members(character_id);
+CREATE INDEX IF NOT EXISTS idx_characters_user_id ON characters(user_id);
+-- Дополнительные ограничения уникальности/проверки могут быть добавлены миграциями в будущем
+CREATE INDEX IF NOT EXISTS idx_characters_is_online ON characters(is_online);
+CREATE INDEX IF NOT EXISTS idx_location_objects_location_id ON location_objects(location_id);
+CREATE INDEX IF NOT EXISTS idx_npcs_location_id ON npcs(location_id);
+CREATE INDEX IF NOT EXISTS idx_inventory_character_id ON inventory(character_id);
+CREATE INDEX IF NOT EXISTS idx_character_quests_character_id ON character_quests(character_id);
+CREATE INDEX IF NOT EXISTS idx_combat_logs_timestamp ON combat_logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_created_at ON chat_messages(created_at);
+CREATE INDEX IF NOT EXISTS idx_player_status_character_id ON player_status(character_id);
+CREATE INDEX IF NOT EXISTS idx_faction_members_character_id ON faction_members(character_id);
+CREATE INDEX IF NOT EXISTS idx_loot_items_loot_table_id ON loot_items(loot_table_id);
+CREATE INDEX IF NOT EXISTS idx_mob_loot_character_id ON mob_loot(character_id);
+CREATE INDEX IF NOT EXISTS idx_skill_coin_transactions_character_id ON skill_coin_transactions(character_id);
+CREATE INDEX IF NOT EXISTS idx_quest_kill_targets_quest_id ON quest_kill_targets(quest_id);
+CREATE INDEX IF NOT EXISTS idx_character_quest_kills_character_id ON character_quest_kills(character_id);

@@ -18,6 +18,18 @@ from backend.database.connection import init_db_pool, close_db_pool, execute_sql
 
 async def init_database():
     """Initialize database schema"""
+    # если .env отсутствует, попытаться создать копию из примера
+    env_path = Path(__file__).parent / ".env"
+    example_path = Path(__file__).parent / ".env.example"
+    if not env_path.exists():
+        if example_path.exists():
+            print("⚠️  Файл .env не найден, создаю из .env.example")
+            with open(example_path, 'r', encoding='utf-8') as src, open(env_path, 'w', encoding='utf-8') as dst:
+                dst.write(src.read())
+            print("✅ .env создан. Обновите строку DATABASE_URL в .env перед запуском.")
+        else:
+            print("⚠️  Ни .env, ни .env.example не найдены. Создайте вручную")
+    
     try:
         print("🎮 DreaMMO Database Initialization")
         print("=" * 50)

@@ -1,10 +1,17 @@
 import psycopg2
 from psycopg2 import pool
 from typing import Optional
-from ..config import settings
+from config import settings
 
 # Глобальный пул соединений
 _db_pool: Optional[pool.SimpleConnectionPool] = None
+
+
+def _dsn_from_url(url: str) -> Optional[str]:
+    if not url:
+        return None
+    # psycopg2 ожидает postgres://
+    return url.replace("postgresql://", "postgres://")
 
 
 async def init_db_pool():
@@ -15,17 +22,21 @@ async def init_db_pool():
     global _db_pool
     
     if _db_pool is None:
-        print("🔌 Подключение к базе данных Neon.tech...")
+        dsn = _dsn_from_url(settings.DATABASE_URL)
+        if not dsn:
+            print("[WARNING] DATABASE_URL не задан. Приложение запущено без подключения к БД.")
+            return
+        print("[INFO] Подключение к базе данных...")
         
         # psycopg2 не async, поэтому используем простой пул
         # Для MVP этого достаточно
         _db_pool = pool.SimpleConnectionPool(
             minconn=2,
             maxconn=10,
-            dsn=settings.DATABASE_URL.replace("postgresql://", "postgres://")
+            dsn=dsn
         )
         
-        print("✅ База данных подключена!")
+        print("[OK] База данных подключена!")
 
 
 async def close_db_pool():
@@ -106,7 +117,10 @@ def execute(query: str, *args):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(query, args)
+            if args:
+                cur.execute(query, args)
+            else:
+                cur.execute(query)
             conn.commit()
             return cur.rowcount
     except Exception as e:

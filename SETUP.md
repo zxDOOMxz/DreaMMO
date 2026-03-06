@@ -21,11 +21,27 @@ cd DreaMMO
 ```bash
 cd backend
 python -m venv venv
-# Windows
-venv\Scripts\activate
-# macOS/Linux
-source venv/bin/activate
 ```
+
+- **Windows (PowerShell)**
+  ```powershell
+  .\venv\Scripts\Activate.ps1
+  # если появляется ошибка про выполнение скриптов:
+  Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+  .\venv\Scripts\Activate.ps1
+  ```
+
+- **Windows (cmd.exe)**
+  ```cmd
+  venv\Scripts\activate.bat
+  ```
+
+- **macOS/Linux**
+  ```bash
+  source venv/bin/activate
+  ```
+
+После активации приглашение терминала изменится, и команды `python`/`pip` будут работать в окружении.
 
 #### 2.2 Install Dependencies
 ```bash
@@ -136,11 +152,16 @@ GET /api/health
 GET /api/test-db
 ```
 
+### Authentication (MVP)
+```
+POST /api/auth/register   # JSON body {username,email,password}
+POST /api/auth/login      # form or query; returns token
+```
+
 ### WebSocket (Real-time)
 ```
 WebSocket /ws/{user_id}
 ```
-
 ---
 
 ## 📚 Project Structure

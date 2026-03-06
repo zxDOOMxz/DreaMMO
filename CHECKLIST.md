@@ -33,6 +33,8 @@
 
 - [x] `/api/health` - Server status
 - [x] `/api/test-db` - Database connectivity
+- [x] `/api/auth/register` - User registration
+- [x] `/api/auth/login` - User login (JWT)
 - [x] `/ws/{user_id}` - WebSocket real-time
 - [x] `/api/characters/create` - Create character
 - [x] `/api/characters/{id}` - Get character details
