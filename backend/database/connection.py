@@ -1,5 +1,6 @@
 import psycopg2
 from psycopg2 import pool
+from psycopg2 import OperationalError, InterfaceError
 from typing import Optional
 from config import settings
 
@@ -75,59 +76,116 @@ def release_db_connection(conn):
         _db_pool.putconn(conn)
 
 
+def _discard_db_connection(conn):
+    """Drop a broken connection from the pool so a fresh one can be created."""
+    if _db_pool is not None and conn is not None:
+        try:
+            _db_pool.putconn(conn, close=True)
+        except Exception:
+            pass
+
+
 # === Утилиты для быстрых запросов ===
 # Примечание: psycopg2 синхронный, поэтому функции не async
 
 def fetch_one(query: str, *args):
     """Получить одну строку результата"""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(query, args)
-            return cur.fetchone()
-    finally:
-        release_db_connection(conn)
+    last_error = None
+    for attempt in range(2):
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, args)
+                return cur.fetchone()
+        except (OperationalError, InterfaceError) as e:
+            last_error = e
+            _discard_db_connection(conn)
+            if attempt == 1:
+                raise
+            continue
+        finally:
+            if conn is not None and not getattr(conn, "closed", 1):
+                release_db_connection(conn)
+    if last_error:
+        raise last_error
 
 
 def fetch_all(query: str, *args):
     """Получить все строки результата"""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(query, args)
-            return cur.fetchall()
-    finally:
-        release_db_connection(conn)
+    last_error = None
+    for attempt in range(2):
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, args)
+                return cur.fetchall()
+        except (OperationalError, InterfaceError) as e:
+            last_error = e
+            _discard_db_connection(conn)
+            if attempt == 1:
+                raise
+            continue
+        finally:
+            if conn is not None and not getattr(conn, "closed", 1):
+                release_db_connection(conn)
+    if last_error:
+        raise last_error
 
 
 def fetch_val(query: str, *args):
     """Получить одно значение"""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(query, args)
-            result = cur.fetchone()
-            return result[0] if result else None
-    finally:
-        release_db_connection(conn)
+    last_error = None
+    for attempt in range(2):
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, args)
+                result = cur.fetchone()
+                return result[0] if result else None
+        except (OperationalError, InterfaceError) as e:
+            last_error = e
+            _discard_db_connection(conn)
+            if attempt == 1:
+                raise
+            continue
+        finally:
+            if conn is not None and not getattr(conn, "closed", 1):
+                release_db_connection(conn)
+    if last_error:
+        raise last_error
 
 
 def execute(query: str, *args):
     """Выполнить запрос без возврата результата"""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            if args:
-                cur.execute(query, args)
-            else:
-                cur.execute(query)
-            conn.commit()
-            return cur.rowcount
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        release_db_connection(conn)
+    last_error = None
+    for attempt in range(2):
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                if args:
+                    cur.execute(query, args)
+                else:
+                    cur.execute(query)
+                conn.commit()
+                return cur.rowcount
+        except (OperationalError, InterfaceError) as e:
+            last_error = e
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            _discard_db_connection(conn)
+            if attempt == 1:
+                raise
+            continue
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            if conn is not None and not getattr(conn, "closed", 1):
+                release_db_connection(conn)
+    if last_error:
+        raise last_error
 
 
 def execute_sql_file(file_path: str):

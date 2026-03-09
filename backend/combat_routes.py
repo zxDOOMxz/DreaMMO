@@ -2,13 +2,27 @@
 Combat system routes with Lineage 2-style mechanics
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel
 from database.connection import fetch_all, fetch_one, execute, fetch_val
 from datetime import datetime
 import random
 import math
+from security import ensure_character_owner, get_current_user_id
+from progression import apply_experience_and_level_up
 
 combat_router = APIRouter()
+
+STAT_FIELDS = ("strength", "dexterity", "constitution", "intelligence", "wisdom", "luck")
+
+
+class StatAllocationRequest(BaseModel):
+    strength: int = 0
+    dexterity: int = 0
+    constitution: int = 0
+    intelligence: int = 0
+    wisdom: int = 0
+    luck: int = 0
 
 # ===== COMBAT FORMULAS (Lineage 2 style) =====
 
@@ -96,28 +110,170 @@ def get_exp_multiplier(character_level, mob_level):
     return 1.0, 1.0
 
 
+def _load_combat_stats_row(character_id: int):
+    return fetch_one(
+        """
+        SELECT c.level,
+               COALESCE(s.strength, 10),
+               COALESCE(s.dexterity, 10),
+               COALESCE(s.constitution, 10),
+               COALESCE(s.intelligence, 10),
+               COALESCE(s.wisdom, 10),
+               COALESCE(s.luck, 10),
+               COALESCE(s.available_stat_points, 0)
+        FROM characters c
+        LEFT JOIN character_stats s ON s.character_id = c.id
+        WHERE c.id = %s
+        """,
+        character_id,
+    )
+
+
+def _build_combat_stats_response(character_id: int) -> dict:
+    char = _load_combat_stats_row(character_id)
+    if not char:
+        raise HTTPException(status_code=404, detail="Character not found")
+
+    lvl, str_val, dex, con, int_val, wis, luck, available_stat_points = char
+
+    equipped_bonus = fetch_one(
+        """
+        SELECT
+            COALESCE(SUM(CASE WHEN inv.equipped = TRUE THEN i.armor_class ELSE 0 END), 0) AS armor_bonus,
+            COALESCE(SUM(CASE WHEN inv.equipped = TRUE AND inv.slot IN ('right_hand', 'both_hands') THEN i.damage_min ELSE 0 END), 0) AS weapon_damage_min,
+            COALESCE(SUM(CASE WHEN inv.equipped = TRUE AND inv.slot IN ('right_hand', 'both_hands') THEN i.damage_max ELSE 0 END), 0) AS weapon_damage_max
+        FROM inventory inv
+        JOIN items i ON i.id = inv.item_id
+        WHERE inv.character_id = %s
+        """,
+        character_id,
+    ) or (0, 0, 0)
+    armor_bonus, weapon_damage_min, weapon_damage_max = equipped_bonus
+
+    # Calculate all combat stats
+    base_dmg_min = 5 + (str_val // 5) + int(weapon_damage_min or 0)
+    base_dmg_max = 10 + (str_val // 3) + int(weapon_damage_max or 0)
+    hit_chance = calculate_hit_chance(dex, 10)
+    crit_chance = calculate_crit_chance(luck)
+    block_chance = calculate_block_chance(dex, con)
+    attack_speed = calculate_attack_speed(60, dex)  # Base 60 attacks/min
+    armor_value = (con - 10) * 0.3 + float(armor_bonus or 0)
+
+    return {
+        "level": lvl,
+        "available_stat_points": int(available_stat_points or 0),
+        "stats": {
+            "strength": str_val,
+            "dexterity": dex,
+            "constitution": con,
+            "intelligence": int_val,
+            "wisdom": wis,
+            "luck": luck
+        },
+        "combat": {
+            "damage_min": base_dmg_min,
+            "damage_max": base_dmg_max,
+            "hit_chance": round(hit_chance, 1),
+            "crit_chance": round(crit_chance, 1),
+            "block_chance": round(block_chance, 1),
+            "attack_speed": round(attack_speed, 1),
+            "armor_value": round(armor_value, 1),
+            "equipment_armor_bonus": int(armor_bonus or 0),
+            "equipment_weapon_damage_min": int(weapon_damage_min or 0),
+            "equipment_weapon_damage_max": int(weapon_damage_max or 0),
+        }
+    }
+
+
+def _is_tank_class(class_name: str) -> bool:
+    normalized = (class_name or "").strip().lower()
+    return "танк" in normalized or "tank" in normalized
+
+
+def _resolve_aggro_target(mob_id: int, attacker_id: int, attacker_is_tank: bool) -> tuple[int, str]:
+    if attacker_is_tank:
+        execute(
+            """
+            INSERT INTO mob_aggro_targets (mob_id, target_character_id, aggro_mode, updated_at)
+            VALUES (%s, %s, 'tank', CURRENT_TIMESTAMP)
+            ON CONFLICT (mob_id) DO UPDATE SET
+                target_character_id = EXCLUDED.target_character_id,
+                aggro_mode = 'tank',
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            mob_id,
+            attacker_id,
+        )
+        return attacker_id, "tank"
+
+    target_row = fetch_one(
+        """
+        SELECT mat.target_character_id
+        FROM mob_aggro_targets mat
+        JOIN characters c ON c.id = mat.target_character_id
+        WHERE mat.mob_id = %s
+          AND c.health_points > 0
+        """,
+        mob_id,
+    )
+    if target_row:
+        return int(target_row[0]), "first_hit"
+
+    execute(
+        """
+        INSERT INTO mob_aggro_targets (mob_id, target_character_id, aggro_mode, updated_at)
+        VALUES (%s, %s, 'first_hit', CURRENT_TIMESTAMP)
+        ON CONFLICT (mob_id) DO UPDATE SET
+            target_character_id = EXCLUDED.target_character_id,
+            aggro_mode = 'first_hit',
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        mob_id,
+        attacker_id,
+    )
+    return attacker_id, "first_hit"
+
+
 # ===== COMBAT API ENDPOINTS =====
 
 @combat_router.post("/combat/attack/{character_id}/{mob_id}")
-async def attack_mob(character_id: int, mob_id: int, ability_id: int = None):
+async def attack_mob(character_id: int, mob_id: int, ability_id: int = None, current_user_id: int = Depends(get_current_user_id)):
     """
     Attack a mob (or use ability)
     Returns combat log entry with damage, XP, gold, loot
     """
     try:
+        ensure_character_owner(character_id, current_user_id)
+
         # Get character stats
         char = fetch_one("""
-            SELECT c.id, c.name, c.level, c.health_points, c.max_health_points, c.position_x, c.position_y,
-                   s.strength, s.dexterity, s.constitution, s.intelligence, s.wisdom, s.luck
+             SELECT c.id, c.name, c.level, c.health_points, c.max_health_points, c.position_x, c.position_y,
+                 s.strength, s.dexterity, s.constitution, s.intelligence, s.wisdom, s.luck,
+                 COALESCE(cc.name, '')
             FROM characters c
             LEFT JOIN character_stats s ON s.character_id = c.id
+             LEFT JOIN character_classes cc ON cc.id = c.class_id
             WHERE c.id = %s
         """, character_id)
         
         if not char:
             raise HTTPException(status_code=404, detail="Character not found")
         
-        char_id, char_name, char_lvl, char_hp, char_max_hp, char_x, char_y, str_val, dex, con, int_val, wis, luck = char
+        char_id, char_name, char_lvl, char_hp, char_max_hp, char_x, char_y, str_val, dex, con, int_val, wis, luck, class_name = char
+
+        equipped_bonus = fetch_one(
+            """
+            SELECT
+                COALESCE(SUM(CASE WHEN inv.equipped = TRUE THEN i.armor_class ELSE 0 END), 0) AS armor_bonus,
+                COALESCE(SUM(CASE WHEN inv.equipped = TRUE AND inv.slot IN ('right_hand', 'both_hands') THEN i.damage_min ELSE 0 END), 0) AS weapon_damage_min,
+                COALESCE(SUM(CASE WHEN inv.equipped = TRUE AND inv.slot IN ('right_hand', 'both_hands') THEN i.damage_max ELSE 0 END), 0) AS weapon_damage_max
+            FROM inventory inv
+            JOIN items i ON i.id = inv.item_id
+            WHERE inv.character_id = %s
+            """,
+            character_id,
+        ) or (0, 0, 0)
+        armor_bonus, weapon_damage_min, weapon_damage_max = equipped_bonus
         
         # Get mob stats
         mob = fetch_one("""
@@ -156,8 +312,8 @@ async def attack_mob(character_id: int, mob_id: int, ability_id: int = None):
         
         # Character attacks mob
         attacker_stats = {
-            'damage_min': 5 + (str_val // 5),  # Base 5 + strength bonus
-            'damage_max': 10 + (str_val // 3),
+            'damage_min': 5 + (str_val // 5) + int(weapon_damage_min or 0),  # Base + equipped weapon bonus
+            'damage_max': 10 + (str_val // 3) + int(weapon_damage_max or 0),
             'strength': str_val,
             'luck': luck
         }
@@ -181,24 +337,64 @@ async def attack_mob(character_id: int, mob_id: int, ability_id: int = None):
         
         # Mob counter-attack (if alive)
         damage_taken = 0
+        target_damage_taken = 0
+        target_character_id = char_id
+        target_character_name = char_name
+        target_character_hp = char_hp
+        attacker_new_hp = char_hp
+        target_character_died = False
         mob_message = ""
         if not mob_killed:
-            mob_is_hit = random.random() * 100 < calculate_hit_chance(10, dex)
-            is_blocked = random.random() * 100 < block_chance
+            target_character_id, aggro_mode = _resolve_aggro_target(mob_id, char_id, _is_tank_class(class_name))
+            target_char = fetch_one(
+                """
+                SELECT c.id, c.name, c.health_points, c.max_health_points,
+                       COALESCE(s.dexterity, 10), COALESCE(s.constitution, 10)
+                FROM characters c
+                LEFT JOIN character_stats s ON s.character_id = c.id
+                WHERE c.id = %s
+                """,
+                target_character_id,
+            )
+
+            if not target_char:
+                target_character_id = char_id
+                target_char = (char_id, char_name, char_hp, char_max_hp, dex, con)
+
+            _, target_character_name, target_character_hp, _, target_dex, target_con = target_char
+            target_block_chance = calculate_block_chance(target_dex, target_con)
+            mob_is_hit = random.random() * 100 < calculate_hit_chance(10, target_dex)
+            is_blocked = random.random() * 100 < target_block_chance
             
             if not mob_is_hit:
                 mob_message = f"✓ {mob_name} промахнулся!"
             elif is_blocked:
-                mob_message = f"🛡️ {char_name} заблокировал атаку {mob_name}!"
+                mob_message = f"🛡️ {target_character_name} заблокировал атаку {mob_name}!"
             else:
-                damage_taken = random.randint(mob_dmg_min, mob_dmg_max)
-                armor_reduction = (con - 10) * 0.3  # Constitution provides armor
-                damage_taken = max(1, int(damage_taken - armor_reduction))
-                mob_message = f"💥 {mob_name} нанёс {damage_taken} урона {char_name}"
+                target_damage_taken = random.randint(mob_dmg_min, mob_dmg_max)
+                target_armor_bonus = fetch_val(
+                    """
+                    SELECT COALESCE(SUM(i.armor_class), 0)
+                    FROM inventory inv
+                    JOIN items i ON i.id = inv.item_id
+                    WHERE inv.character_id = %s AND inv.equipped = TRUE
+                    """,
+                    target_character_id,
+                ) or 0
+                armor_reduction = (target_con - 10) * 0.3 + float(target_armor_bonus)  # Constitution + equipped armor
+                target_damage_taken = max(1, int(target_damage_taken - armor_reduction))
+                damage_taken = target_damage_taken
+                mob_message = f"💥 {mob_name} нанёс {target_damage_taken} урона {target_character_name}"
+                if target_character_id != char_id:
+                    mob_message += f" (агр: {aggro_mode})"
         
-        # Update character HP
-        new_char_hp = max(0, char_hp - damage_taken)
-        char_died = new_char_hp <= 0
+            new_target_hp = max(0, target_character_hp - target_damage_taken)
+            target_character_died = new_target_hp <= 0
+            execute("UPDATE characters SET health_points = %s WHERE id = %s", new_target_hp, target_character_id)
+            if target_character_id == char_id:
+                attacker_new_hp = new_target_hp
+        else:
+            attacker_new_hp = char_hp
         
         # Calculate XP and gold with Lineage 2 penalties
         exp_gained = 0
@@ -209,28 +405,58 @@ async def attack_mob(character_id: int, mob_id: int, ability_id: int = None):
             exp_mult, gold_mult = get_exp_multiplier(char_lvl, mob_lvl)
             exp_gained = int(mob_exp * exp_mult)
             gold_gained = int(mob_gold * gold_mult)
-            
-            # Update character
-            execute("""
-                UPDATE characters
-                SET experience = experience + %s,
-                    gold = gold + %s,
-                    health_points = %s
-                WHERE id = %s
-            """, exp_gained, gold_gained, new_char_hp, character_id)
+
+            progression = apply_experience_and_level_up(character_id, exp_gained, gold_gained)
+            execute("UPDATE characters SET health_points = %s WHERE id = %s", attacker_new_hp, character_id)
             
             # Respawn mob or mark as dead
             execute("UPDATE mobs SET health_points = 0 WHERE id = %s", mob_id)
+            execute("DELETE FROM mob_aggro_targets WHERE mob_id = %s", mob_id)
+
+            # Auto-update active kill quests that target this mob.
+            active_quest_ids = fetch_all(
+                """
+                SELECT cq.quest_id
+                FROM character_quests cq
+                JOIN quest_kill_targets qkt ON qkt.quest_id = cq.quest_id
+                WHERE cq.character_id = %s
+                  AND cq.status = 'active'
+                  AND qkt.mob_id = %s
+                """,
+                character_id,
+                mob_id,
+            )
+            for quest_row in active_quest_ids:
+                quest_id = quest_row[0]
+                existing_kill = fetch_one(
+                    "SELECT id FROM character_quest_kills WHERE character_id = %s AND quest_id = %s AND mob_id = %s",
+                    character_id,
+                    quest_id,
+                    mob_id,
+                )
+                if existing_kill:
+                    execute(
+                        "UPDATE character_quest_kills SET kill_count = kill_count + 1 WHERE id = %s",
+                        existing_kill[0],
+                    )
+                else:
+                    execute(
+                        "INSERT INTO character_quest_kills (character_id, quest_id, mob_id, kill_count) VALUES (%s, %s, %s, 1)",
+                        character_id,
+                        quest_id,
+                        mob_id,
+                    )
             
             # Check for loot (simplified)
             # TODO: Implement full loot table system
             
-            mob_message = f"☠️ {mob_name} повержен! +{exp_gained} опыта, +{gold_gained} золота"
+            level_note = ""
+            if progression.get("leveled_up"):
+                level_note = f" | Уровень повышен до {progression.get('level')}"
+            mob_message = f"☠️ {mob_name} повержен! +{exp_gained} опыта, +{gold_gained} золота{level_note}"
         else:
             # Update mob HP
             execute("UPDATE mobs SET health_points = %s WHERE id = %s", new_mob_hp, mob_id)
-            # Update character HP
-            execute("UPDATE characters SET health_points = %s WHERE id = %s", new_char_hp, character_id)
         
         # Log combat
         execute("""
@@ -248,12 +474,14 @@ async def attack_mob(character_id: int, mob_id: int, ability_id: int = None):
             "is_critical": is_crit,
             "is_miss": not is_hit,
             "mob_killed": mob_killed,
-            "character_died": char_died,
+            "character_died": target_character_died if target_character_id == char_id else False,
             "exp_gained": exp_gained,
             "gold_gained": gold_gained,
             "loot": loot_items,
-            "character_hp": new_char_hp,
+            "character_hp": attacker_new_hp,
             "character_max_hp": char_max_hp,
+            "mob_target_character_id": target_character_id,
+            "mob_target_character_name": target_character_name,
             "mob_hp": new_mob_hp,
             "mob_max_hp": mob_max_hp
         }
@@ -264,11 +492,13 @@ async def attack_mob(character_id: int, mob_id: int, ability_id: int = None):
 
 
 @combat_router.get("/combat/log/{character_id}")
-async def get_combat_log(character_id: int, limit: int = 20):
+async def get_combat_log(character_id: int, limit: int = 20, current_user_id: int = Depends(get_current_user_id)):
     """
     Get recent combat log for character
     """
     try:
+        ensure_character_owner(character_id, current_user_id)
+
         logs = fetch_all("""
             SELECT cl.combat_message, cl.damage_dealt, cl.damage_taken, cl.is_critical, cl.is_miss, cl.is_blocked, cl.timestamp,
                    m.name as mob_name
@@ -298,51 +528,111 @@ async def get_combat_log(character_id: int, limit: int = 20):
 
 
 @combat_router.get("/combat/stats/{character_id}")
-async def get_combat_stats(character_id: int):
+async def get_combat_stats(character_id: int, current_user_id: int = Depends(get_current_user_id)):
     """
     Get calculated combat statistics for character
     """
     try:
-        char = fetch_one("""
-            SELECT c.level, s.strength, s.dexterity, s.constitution, s.intelligence, s.wisdom, s.luck
-            FROM characters c
-            LEFT JOIN character_stats s ON s.character_id = c.id
-            WHERE c.id = %s
-        """, character_id)
-        
-        if not char:
-            raise HTTPException(status_code=404, detail="Character not found")
-        
-        lvl, str_val, dex, con, int_val, wis, luck = char
-        
-        # Calculate all combat stats
-        base_dmg_min = 5 + (str_val // 5)
-        base_dmg_max = 10 + (str_val // 3)
-        hit_chance = calculate_hit_chance(dex, 10)
-        crit_chance = calculate_crit_chance(luck)
-        block_chance = calculate_block_chance(dex, con)
-        attack_speed = calculate_attack_speed(60, dex)  # Base 60 attacks/min
-        armor_value = (con - 10) * 0.3
-        
+        ensure_character_owner(character_id, current_user_id)
+        return _build_combat_stats_response(character_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@combat_router.post("/combat/stats/{character_id}/allocate")
+async def allocate_stat_points(
+    character_id: int,
+    payload: StatAllocationRequest,
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """Allocate unspent stat points into character attributes."""
+    try:
+        ensure_character_owner(character_id, current_user_id)
+
+        execute(
+            """
+            INSERT INTO character_stats (character_id)
+            VALUES (%s)
+            ON CONFLICT (character_id) DO NOTHING
+            """,
+            character_id,
+        )
+
+        allocation = {field: max(0, int(getattr(payload, field, 0) or 0)) for field in STAT_FIELDS}
+        points_to_spend = sum(allocation.values())
+        if points_to_spend <= 0:
+            raise HTTPException(status_code=400, detail="No points provided for allocation")
+
+        current = fetch_one(
+            "SELECT COALESCE(available_stat_points, 0) FROM character_stats WHERE character_id = %s",
+            character_id,
+        )
+        available_points = int(current[0] if current else 0)
+        if points_to_spend > available_points:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Not enough available points: {available_points}",
+            )
+
+        updated = execute(
+            """
+            UPDATE character_stats
+            SET strength = COALESCE(strength, 10) + %s,
+                dexterity = COALESCE(dexterity, 10) + %s,
+                constitution = COALESCE(constitution, 10) + %s,
+                intelligence = COALESCE(intelligence, 10) + %s,
+                wisdom = COALESCE(wisdom, 10) + %s,
+                luck = COALESCE(luck, 10) + %s,
+                available_stat_points = COALESCE(available_stat_points, 0) - %s,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE character_id = %s
+              AND COALESCE(available_stat_points, 0) >= %s
+            """,
+            allocation["strength"],
+            allocation["dexterity"],
+            allocation["constitution"],
+            allocation["intelligence"],
+            allocation["wisdom"],
+            allocation["luck"],
+            points_to_spend,
+            character_id,
+            points_to_spend,
+        )
+        if not updated:
+            raise HTTPException(status_code=400, detail="Failed to allocate points")
+
+        # Derived pools react instantly to stat spending.
+        con_gain = allocation["constitution"]
+        int_gain = allocation["intelligence"]
+        wis_gain = allocation["wisdom"]
+        hp_gain = con_gain * 5
+        mp_gain = (int_gain * 3) + (wis_gain * 2)
+        if hp_gain > 0 or mp_gain > 0:
+            execute(
+                """
+                UPDATE characters
+                SET max_health_points = max_health_points + %s,
+                    health_points = LEAST(max_health_points + %s, health_points + %s),
+                    max_mana_points = max_mana_points + %s,
+                    mana_points = LEAST(max_mana_points + %s, mana_points + %s)
+                WHERE id = %s
+                """,
+                hp_gain,
+                hp_gain,
+                hp_gain,
+                mp_gain,
+                mp_gain,
+                mp_gain,
+                character_id,
+            )
+
         return {
-            "level": lvl,
-            "stats": {
-                "strength": str_val,
-                "dexterity": dex,
-                "constitution": con,
-                "intelligence": int_val,
-                "wisdom": wis,
-                "luck": luck
-            },
-            "combat": {
-                "damage_min": base_dmg_min,
-                "damage_max": base_dmg_max,
-                "hit_chance": round(hit_chance, 1),
-                "crit_chance": round(crit_chance, 1),
-                "block_chance": round(block_chance, 1),
-                "attack_speed": round(attack_speed, 1),
-                "armor_value": round(armor_value, 1)
-            }
+            "status": "success",
+            "spent_points": points_to_spend,
+            "allocation": allocation,
+            "combat_stats": _build_combat_stats_response(character_id),
         }
     except HTTPException:
         raise

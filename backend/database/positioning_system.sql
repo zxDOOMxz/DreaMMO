@@ -3,6 +3,7 @@
 ALTER TABLE characters ADD COLUMN IF NOT EXISTS current_location_id INTEGER REFERENCES locations(id);
 ALTER TABLE characters ADD COLUMN IF NOT EXISTS position_x FLOAT DEFAULT 0;
 ALTER TABLE characters ADD COLUMN IF NOT EXISTS position_y FLOAT DEFAULT 0;
+ALTER TABLE characters ADD COLUMN IF NOT EXISTS position_z FLOAT DEFAULT 0;
 ALTER TABLE characters ADD COLUMN IF NOT EXISTS target_object_id INTEGER;
 ALTER TABLE characters ADD COLUMN IF NOT EXISTS target_object_type VARCHAR(50);
 ALTER TABLE characters ADD COLUMN IF NOT EXISTS distance_to_target FLOAT DEFAULT 0;
@@ -16,10 +17,11 @@ CREATE TABLE IF NOT EXISTS mob_spawn_zones (
     id SERIAL PRIMARY KEY,
     location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
     zone_name VARCHAR(100) NOT NULL,
-    zone_type VARCHAR(50), -- pack, boss, raid, dungeon
+    zone_type VARCHAR(50), -- city, hunting, resource
     distance_from_center FLOAT NOT NULL, -- distance in meters
     position_x FLOAT DEFAULT 0,
     position_y FLOAT DEFAULT 0,
+    position_z FLOAT DEFAULT 0,
     radius FLOAT DEFAULT 20, -- spawn radius in meters
     min_level INTEGER DEFAULT 1,
     max_level INTEGER DEFAULT 10,
@@ -45,6 +47,7 @@ CREATE TABLE IF NOT EXISTS mob_zone_spawns (
 -- Add position to mobs
 ALTER TABLE mobs ADD COLUMN IF NOT EXISTS position_x FLOAT DEFAULT 0;
 ALTER TABLE mobs ADD COLUMN IF NOT EXISTS position_y FLOAT DEFAULT 0;
+ALTER TABLE mobs ADD COLUMN IF NOT EXISTS position_z FLOAT DEFAULT 0;
 ALTER TABLE mobs ADD COLUMN IF NOT EXISTS spawn_zone_id INTEGER REFERENCES mob_spawn_zones(id);
 ALTER TABLE mobs ADD COLUMN IF NOT EXISTS is_champion BOOLEAN DEFAULT FALSE;
 ALTER TABLE mobs ADD COLUMN IF NOT EXISTS champion_stars INTEGER DEFAULT 0; -- 0, 1, 2, 3 stars
@@ -155,6 +158,7 @@ ALTER TABLE location_objects ADD COLUMN IF NOT EXISTS interaction_range FLOAT DE
 -- NPC positions
 ALTER TABLE npcs ADD COLUMN IF NOT EXISTS position_x FLOAT DEFAULT 0;
 ALTER TABLE npcs ADD COLUMN IF NOT EXISTS position_y FLOAT DEFAULT 0;
+ALTER TABLE npcs ADD COLUMN IF NOT EXISTS position_z FLOAT DEFAULT 0;
 ALTER TABLE npcs ADD COLUMN IF NOT EXISTS distance_from_center FLOAT DEFAULT 0;
 
 -- ===== INDEXES FOR PERFORMANCE =====

@@ -85,9 +85,9 @@ def seed_initial_data(conn):
         if row:
             location_id = row[0]
             npcs = [
-                ("Guard Captain", "guard", 5, 100),
-                ("Wandering Merchant", "merchant", 2, 50),
-                ("Old Sage", "quest_giver", 10, 200),
+                ("Страж Тордек", "guard", 5, 100),
+                ("Торговец Маркус", "merchant", 2, 50),
+                ("Охотник Раймонд", "quest_giver", 10, 200),
             ]
             for name, npc_type, level, hp in npcs:
                 cur.execute(

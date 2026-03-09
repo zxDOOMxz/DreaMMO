@@ -6,17 +6,153 @@ Main game mechanics endpoints
 from fastapi import APIRouter, HTTPException, status, Depends
 from pydantic import BaseModel, EmailStr
 from typing import List, Optional
+import json
+import random
 from database.connection import fetch_one, fetch_all, execute, fetch_val
 from passlib.hash import bcrypt
-from jose import jwt
-from config import settings
-
-# simple JWT util (for demo purposes)
-SECRET_KEY = settings.JWT_SECRET
-ALGORITHM = settings.JWT_ALGORITHM
+from security import (
+    create_access_token,
+    ensure_character_owner,
+    ensure_user_matches,
+    get_current_user_id,
+)
+from progression import apply_experience_and_level_up
 
 # ===== Route Definitions =====
 router = APIRouter(prefix="/api", tags=["game"])
+
+COMMON_STARTER_PACK = {
+    "Малое зелье лечения": 3,
+}
+
+MELEE_STARTER_PACK = {
+    "Учебный меч": 1,
+    "Учебный двуручный меч": 1,
+    "Учебный щит": 1,
+    "Потрепанная куртка": 1,
+}
+
+MAGE_STARTER_PACK = {
+    "Учебный посох": 1,
+    "Роба ученика": 1,
+}
+
+RANGED_STARTER_PACK = {
+    "Учебный лук": 1,
+    "Потрепанная куртка": 1,
+}
+
+
+def _inventory_count(character_id: int, item_id: int) -> int:
+    return int(
+        fetch_val(
+            "SELECT COALESCE(SUM(quantity), 0) FROM inventory WHERE character_id = %s AND item_id = %s",
+            character_id,
+            item_id,
+        )
+        or 0
+    )
+
+
+def _inventory_add(character_id: int, item_id: int, quantity: int) -> None:
+    if quantity <= 0:
+        return
+    existing = fetch_one(
+        "SELECT id, quantity FROM inventory WHERE character_id = %s AND item_id = %s AND slot IS NULL LIMIT 1",
+        character_id,
+        item_id,
+    )
+    if existing:
+        execute("UPDATE inventory SET quantity = quantity + %s WHERE id = %s", quantity, existing[0])
+    else:
+        execute(
+            "INSERT INTO inventory (character_id, item_id, quantity, equipped, slot) VALUES (%s, %s, %s, FALSE, NULL)",
+            character_id,
+            item_id,
+            quantity,
+        )
+
+
+def _inventory_remove(character_id: int, item_id: int, quantity: int) -> None:
+    if quantity <= 0:
+        return
+    rows = fetch_all(
+        "SELECT id, quantity FROM inventory WHERE character_id = %s AND item_id = %s ORDER BY created_at ASC",
+        character_id,
+        item_id,
+    )
+    remaining = quantity
+    for row_id, row_qty in rows:
+        if remaining <= 0:
+            break
+        take = min(remaining, int(row_qty or 0))
+        new_qty = int(row_qty or 0) - take
+        if new_qty <= 0:
+            execute("DELETE FROM inventory WHERE id = %s", row_id)
+        else:
+            execute("UPDATE inventory SET quantity = %s WHERE id = %s", new_qty, row_id)
+        remaining -= take
+    if remaining > 0:
+        raise HTTPException(status_code=400, detail="Not enough materials in inventory")
+
+
+def _starter_pack_for_class(class_name: str) -> dict:
+    normalized = (class_name or "").strip().lower()
+    pack = dict(COMMON_STARTER_PACK)
+
+    if normalized in {"воин", "танк"}:
+        pack.update(MELEE_STARTER_PACK)
+    elif normalized in {"маг огня", "ледяной маг", "некромант", "целитель"}:
+        pack.update(MAGE_STARTER_PACK)
+    else:
+        pack.update(RANGED_STARTER_PACK)
+
+    return pack
+
+
+def _honor_reward_for_quest(level_requirement: int, quest_type: str) -> int:
+    lvl = int(level_requirement or 1)
+    if lvl <= 1:
+        reward = 1
+    elif lvl <= 3:
+        reward = 2
+    elif lvl <= 5:
+        reward = 3
+    elif lvl <= 7:
+        reward = 4
+    else:
+        reward = 5
+
+    if (quest_type or "").lower() in {"boss", "dungeon", "elite"}:
+        reward = min(5, reward + 1)
+
+    return max(1, min(5, reward))
+
+
+def _ensure_starter_pack(character_id: int) -> list:
+    """Backfill missing class starter items for existing characters once."""
+    class_row = fetch_one(
+        """
+        SELECT cc.name
+        FROM characters c
+        LEFT JOIN character_classes cc ON cc.id = c.class_id
+        WHERE c.id = %s
+        """,
+        character_id,
+    )
+    starter_pack = _starter_pack_for_class(class_row[0] if class_row else "")
+
+    granted = []
+    for item_name, required_qty in starter_pack.items():
+        item_id = fetch_val("SELECT id FROM items WHERE name = %s LIMIT 1", item_name)
+        if not item_id:
+            continue
+        owned_qty = _inventory_count(character_id, int(item_id))
+        missing = int(required_qty) - owned_qty
+        if missing > 0:
+            _inventory_add(character_id, int(item_id), int(missing))
+            granted.append({"item_name": item_name, "quantity": int(missing)})
+    return granted
 
 # ===== Authentication =====
 class RegisterModel(BaseModel):
@@ -33,36 +169,56 @@ class LoginModel(BaseModel):
     password: str
 
 
+class ChangePasswordModel(BaseModel):
+    current_password: str
+    new_password: str
+
+
 @router.post("/auth/register", response_model=dict)
 async def register(user: RegisterModel):
     """Create a new user account"""
     try:
-        exists = fetch_one("SELECT id FROM users WHERE username = %s OR email = %s", user.username, user.email)
+        normalized_username = user.username.strip()
+        normalized_email = user.email.strip().lower()
+
+        exists = fetch_one(
+            "SELECT id FROM users WHERE LOWER(username) = LOWER(%s) OR LOWER(email) = LOWER(%s)",
+            normalized_username,
+            normalized_email,
+        )
         if exists:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Username or email already registered"
             )
+        if len(user.password) < 8:
+            raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+        if len(normalized_username) < 3:
+            raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
+
         hashed = bcrypt.hash(user.password)
         execute(
             "INSERT INTO users (username, email, password_hash) VALUES (%s,%s,%s)",
-            user.username, user.email, hashed
+            normalized_username, normalized_email, hashed
         )
         return {"status": "success", "data": {"registered": True}}
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Registration failed")
 
 
 @router.post("/auth/login", response_model=TokenResponse)
 async def login(payload: LoginModel):
     """Authenticate and return JWT token"""
-    user_record = fetch_one("SELECT id, password_hash FROM users WHERE username = %s", payload.username)
+    user_record = fetch_one(
+        "SELECT id, password_hash FROM users WHERE LOWER(username) = LOWER(%s)",
+        payload.username.strip(),
+    )
     if not user_record or not bcrypt.verify(payload.password, user_record[1]):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     user_id = user_record[0]
-    token = jwt.encode({"sub": str(user_id)}, SECRET_KEY, algorithm=ALGORITHM)
+    token = create_access_token(user_id)
     # Обновим last_login и пометим персонажей пользователя как online
     try:
         execute("UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = %s", user_id)
@@ -70,6 +226,42 @@ async def login(payload: LoginModel):
     except Exception:
         pass
     return TokenResponse(access_token=token)
+
+
+@router.post("/auth/change-password", response_model=dict)
+async def change_password(
+    payload: ChangePasswordModel,
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """Change password for currently authenticated user."""
+    try:
+        if len(payload.new_password) < 8:
+            raise HTTPException(status_code=400, detail="New password must be at least 8 characters")
+        if payload.new_password == payload.current_password:
+            raise HTTPException(status_code=400, detail="New password must be different from current password")
+
+        user_record = fetch_one(
+            "SELECT password_hash FROM users WHERE id = %s",
+            current_user_id,
+        )
+        if not user_record:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        if not bcrypt.verify(payload.current_password, user_record[0]):
+            raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+        new_hash = bcrypt.hash(payload.new_password)
+        execute(
+            "UPDATE users SET password_hash = %s WHERE id = %s",
+            new_hash,
+            current_user_id,
+        )
+
+        return {"status": "success", "message": "Password updated"}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to update password")
 
 
 # ===== Characters =====
@@ -93,6 +285,80 @@ class CharacterResponse(BaseModel):
     experience: int
     health_points: int
     max_health_points: int
+
+
+class EquipItemModel(BaseModel):
+    item_id: int
+
+
+class UnequipItemModel(BaseModel):
+    slot: str
+
+
+def _resolve_equipment_slot(item_type: str) -> str:
+    kind = (item_type or "").lower().strip()
+    slot_map = {
+        "weapon": "right_hand",
+        "melee_weapon": "right_hand",
+        "sword": "right_hand",
+        "axe": "right_hand",
+        "mace": "right_hand",
+        "one_handed_weapon": "right_hand",
+        "weapon_1h": "right_hand",
+        "two_handed_weapon": "right_hand",
+        "weapon_2h": "right_hand",
+        "bow": "right_hand",
+        "staff": "right_hand",
+        "armor": "chest",
+        "chest_armor": "chest",
+        "body_armor": "chest",
+        "robe": "chest",
+        "shield": "left_hand",
+        "helmet": "head",
+        "hat": "head",
+        "boots": "feet",
+        "gloves": "hands",
+        "pants": "legs",
+        "ring": "ring",
+        "accessory": "ring",
+    }
+    return slot_map.get(kind, "")
+
+
+def _normalize_equipment_slot(slot: str) -> str:
+    normalized = (slot or "").strip().lower()
+    slot_aliases = {
+        "main_hand": "right_hand",
+        "off_hand": "left_hand",
+        "body": "chest",
+        "torso": "chest",
+    }
+    return slot_aliases.get(normalized, normalized)
+
+
+def _slot_aliases_for_query(slot: str) -> list:
+    normalized = _normalize_equipment_slot(slot)
+    aliases = {
+        "right_hand": ["right_hand", "main_hand"],
+        "left_hand": ["left_hand", "off_hand"],
+        "chest": ["chest", "body", "torso"],
+        "head": ["head"],
+        "legs": ["legs"],
+        "feet": ["feet"],
+        "ring_left": ["ring_left"],
+        "ring_right": ["ring_right"],
+        "both_hands": ["both_hands"],
+    }
+    return aliases.get(normalized, [normalized])
+
+
+def _is_two_handed_item(item_type: str, item_name: str, item_description: str) -> bool:
+    kind = (item_type or "").lower().strip()
+    text = f"{item_name or ''} {item_description or ''}".lower()
+    if kind in {"two_handed_weapon", "weapon_2h", "weapon_two_handed"}:
+        return True
+    markers = ["двуруч", "двумя руками", "two-handed", "2h", "greatsword", "polearm"]
+    return any(marker in text for marker in markers)
 
 @router.get("/characters/{character_id}/abilities", response_model=dict)
 async def get_character_abilities(character_id: int):
@@ -145,10 +411,12 @@ async def get_races():
         for r in races:
             # Get passive abilities for this race
             passives = fetch_all("""
-                SELECT a.id, a.name, a.description
+                SELECT MIN(a.id) AS id, a.name, a.description
                 FROM race_passive_abilities rpa
                 JOIN abilities a ON rpa.ability_id = a.id
                 WHERE rpa.race_id = %s
+                GROUP BY a.name, a.description
+                ORDER BY a.name
             """, r[0])
             
             race_data = {
@@ -184,7 +452,17 @@ async def get_races():
 async def get_classes():
     """Get all available character classes"""
     try:
-        classes = fetch_all("SELECT id, name, description, base_health, base_mana FROM character_classes ORDER BY id")
+        classes = fetch_all(
+            """
+            SELECT id, name, description, base_health, base_mana,
+                   COALESCE(base_strength, 10), COALESCE(base_dexterity, 10),
+                   COALESCE(base_constitution, 10), COALESCE(base_intelligence, 10),
+                   COALESCE(base_wisdom, 10), COALESCE(base_luck, 10),
+                   primary_stat
+            FROM character_classes
+            ORDER BY id
+            """
+        )
         return {
             "classes": [
                 {
@@ -192,7 +470,16 @@ async def get_classes():
                     "name": c[1],
                     "description": c[2],
                     "base_health": c[3],
-                    "base_mana": c[4]
+                    "base_mana": c[4],
+                    "base_stats": {
+                        "strength": c[5],
+                        "dexterity": c[6],
+                        "constitution": c[7],
+                        "intelligence": c[8],
+                        "wisdom": c[9],
+                        "luck": c[10],
+                    },
+                    "primary_stat": c[11],
                 }
                 for c in classes
             ]
@@ -201,16 +488,18 @@ async def get_classes():
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/characters/create", response_model=dict)
-async def create_character(data: dict):
+async def create_character(data: dict, current_user_id: int = Depends(get_current_user_id)):
     """Create new character for player"""
     try:
-        user_id = data.get('user_id')
+        user_id = data.get('user_id') or current_user_id
         name = data.get('name')
         class_id = data.get('class_id')
         race_id = data.get('race_id')
         
         if not all([user_id, name, class_id, race_id]):
             raise HTTPException(status_code=400, detail="Missing required fields")
+
+        ensure_user_matches(int(user_id), current_user_id)
         
         # Check if character name exists
         existing = fetch_one("SELECT id FROM characters WHERE name = %s", name)
@@ -222,7 +511,17 @@ async def create_character(data: dict):
         
         # Get race and class bonuses
         race = fetch_one("SELECT strength_bonus, dexterity_bonus, constitution_bonus, intelligence_bonus, wisdom_bonus, luck_bonus FROM races WHERE id = %s", race_id)
-        char_class = fetch_one("SELECT base_health, base_mana FROM character_classes WHERE id = %s", class_id)
+        char_class = fetch_one(
+            """
+            SELECT base_health, base_mana,
+                   COALESCE(base_strength, 10), COALESCE(base_dexterity, 10),
+                   COALESCE(base_constitution, 10), COALESCE(base_intelligence, 10),
+                   COALESCE(base_wisdom, 10), COALESCE(base_luck, 10)
+            FROM character_classes
+            WHERE id = %s
+            """,
+            class_id,
+        )
         
         if not race or not char_class:
             raise HTTPException(status_code=404, detail="Invalid race or class")
@@ -233,7 +532,7 @@ async def create_character(data: dict):
         
         # Create character with spawn location set to Элдория (location_id = 1)
         execute(
-            "INSERT INTO characters (user_id, name, race_id, class_id, level, experience, health_points, max_health_points, mana_points, max_mana_points, current_location_id, position_x, position_y) VALUES (%s, %s, %s, %s, 1, 0, %s, %s, %s, %s, 1, 0, 0)",
+            "INSERT INTO characters (user_id, name, race_id, class_id, level, experience, health_points, max_health_points, mana_points, max_mana_points, gold, silver, current_location_id, position_x, position_y) VALUES (%s, %s, %s, %s, 1, 0, %s, %s, %s, %s, 100, 100, 1, 0, 0)",
             user_id, name, race_id, class_id, base_health, base_health, base_mana, base_mana
         )
         
@@ -243,12 +542,57 @@ async def create_character(data: dict):
         execute("""
             INSERT INTO character_stats (character_id, strength, dexterity, constitution, intelligence, wisdom, luck)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, char_id, 10 + race[0], 10 + race[1], 10 + race[2], 10 + race[3], 10 + race[4], 10 + race[5])
+        """, char_id, char_class[2] + race[0], char_class[3] + race[1], char_class[4] + race[2], char_class[5] + race[3], char_class[6] + race[4], char_class[7] + race[5])
         
-        # Give class abilities
-        abilities = fetch_all("SELECT id FROM abilities WHERE class_id = %s", class_id)
-        for ability in abilities:
-            execute("INSERT INTO character_abilities (character_id, ability_id, level) VALUES (%s, %s, 1)", char_id, ability[0])
+        # Give only first class base ability at level 1 (not the whole class tree).
+        base_class_ability = fetch_one(
+            """
+            SELECT id
+            FROM abilities
+            WHERE class_id = %s AND level_requirement <= 1
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            class_id,
+        )
+        if base_class_ability:
+            execute(
+                "INSERT INTO character_abilities (character_id, ability_id, level) VALUES (%s, %s, 1) ON CONFLICT DO NOTHING",
+                char_id,
+                base_class_ability[0],
+            )
+
+        # Give one active race skill.
+        race_name = fetch_val("SELECT name FROM races WHERE id = %s", race_id)
+        class_name = fetch_val("SELECT name FROM character_classes WHERE id = %s", class_id)
+        race_skill_name = f"{race_name}: Первый путь" if race_name else None
+        if race_skill_name:
+            race_skill_id = fetch_val("SELECT id FROM abilities WHERE name = %s LIMIT 1", race_skill_name)
+            if race_skill_id:
+                execute(
+                    "INSERT INTO character_abilities (character_id, ability_id, level) VALUES (%s, %s, 1) ON CONFLICT DO NOTHING",
+                    char_id,
+                    int(race_skill_id),
+                )
+
+        # Give race-specific class starter attack from strict identity set.
+        if race_name and class_name:
+            race_class_skill_id = fetch_val(
+                """
+                SELECT id
+                FROM abilities
+                WHERE name LIKE %s
+                ORDER BY level_requirement ASC, id ASC
+                LIMIT 1
+                """,
+                f"{race_name} {class_name}: [ATK1]%",
+            )
+            if race_class_skill_id:
+                execute(
+                    "INSERT INTO character_abilities (character_id, ability_id, level) VALUES (%s, %s, 1) ON CONFLICT DO NOTHING",
+                    char_id,
+                    int(race_class_skill_id),
+                )
         
         # Give race passive abilities
         race_abilities = fetch_all("SELECT ability_id FROM race_passive_abilities WHERE race_id = %s", race_id)
@@ -258,6 +602,9 @@ async def create_character(data: dict):
         # Initialize skill coins and butchering skill
         execute("INSERT INTO skill_coins (character_id, balance, total_earned, total_spent) VALUES (%s, 0, 0, 0)", char_id)
         execute("INSERT INTO butchering_skill (character_id, skill_level, experience) VALUES (%s, 1, 0)", char_id)
+
+        # Starter inventory pack for new characters.
+        _ensure_starter_pack(char_id)
         
         return {
             "status": "success",
@@ -276,16 +623,18 @@ async def create_character(data: dict):
         }
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Character creation failed")
 
 @router.delete("/characters/{character_id}")
-async def delete_character(character_id: int):
+async def delete_character(character_id: int, current_user_id: int = Depends(get_current_user_id)):
     """Delete a character and all related data"""
     try:
         exists = fetch_one("SELECT id FROM characters WHERE id = %s", character_id)
         if not exists:
             raise HTTPException(status_code=404, detail="Character not found")
+
+        ensure_character_owner(character_id, current_user_id)
 
         # Most related tables are configured with ON DELETE CASCADE.
         execute("DELETE FROM characters WHERE id = %s", character_id)
@@ -300,19 +649,26 @@ async def delete_character(character_id: int):
         )
 
 @router.get("/characters", response_model=dict)
-async def list_characters(user_id: int):
+async def list_characters(user_id: int, current_user_id: int = Depends(get_current_user_id)):
     """Get all characters for a user"""
     try:
+        ensure_user_matches(user_id, current_user_id)
+
         characters = fetch_all(
             """
-            SELECT id, name, level, experience,
-                   health_points, max_health_points,
-                   mana_points AS magic_points,
-                   max_mana_points AS max_magic_points,
-                   gold
-            FROM characters
+                 SELECT c.id, c.name, c.level, c.experience,
+                     c.health_points, c.max_health_points,
+                     c.mana_points AS magic_points,
+                     c.max_mana_points AS max_magic_points,
+                                         c.gold,
+                                         COALESCE(c.silver, 0) AS silver,
+                   COALESCE(r.name, 'Не выбрана') AS race_name,
+                   COALESCE(cc.name, 'Не выбран') AS class_name
+            FROM characters c
+            LEFT JOIN races r ON r.id = c.race_id
+            LEFT JOIN character_classes cc ON cc.id = c.class_id
             WHERE user_id = %s
-            ORDER BY created_at DESC
+            ORDER BY c.created_at DESC
             """,
             user_id
         )
@@ -329,7 +685,10 @@ async def list_characters(user_id: int):
                     "max_health_points": c[5],
                     "magic_points": c[6],
                     "max_magic_points": c[7],
-                    "gold": c[8]
+                    "gold": c[8],
+                    "silver": c[9],
+                    "race_name": c[10],
+                    "class_name": c[11]
                 }
                 for c in characters
             ]
@@ -341,21 +700,28 @@ async def list_characters(user_id: int):
         )
 
 @router.get("/characters/{character_id}/inventory", response_model=dict)
-async def get_character_inventory(character_id: int):
+async def get_character_inventory(character_id: int, current_user_id: int = Depends(get_current_user_id)):
     """Get character inventory items and gold."""
     try:
+        ensure_character_owner(character_id, current_user_id)
+
         char_row = fetch_one(
-            "SELECT id, gold FROM characters WHERE id = %s",
+            "SELECT id, gold, COALESCE(silver, 0) FROM characters WHERE id = %s",
             character_id
         )
 
         if not char_row:
             raise HTTPException(status_code=404, detail="Character not found")
 
+        starter_granted = _ensure_starter_pack(character_id)
+
         item_rows = fetch_all(
             """
-            SELECT i.id, i.name, i.item_type, i.rarity, i.value,
-                   inv.quantity, inv.equipped, inv.slot
+             SELECT i.id, i.name, i.item_type, i.rarity, i.value,
+                 inv.quantity, inv.equipped, inv.slot,
+                 COALESCE(i.description, ''),
+                 COALESCE(i.damage_min, 0), COALESCE(i.damage_max, 0),
+                 COALESCE(i.armor_class, 0), COALESCE(i.health_recovery, 0)
             FROM inventory inv
             JOIN items i ON i.id = inv.item_id
             WHERE inv.character_id = %s
@@ -367,6 +733,8 @@ async def get_character_inventory(character_id: int):
         return {
             "character_id": character_id,
             "gold": char_row[1] or 0,
+            "silver": char_row[2] or 0,
+            "starter_items_granted": starter_granted,
             "inventory": [
                 {
                     "item_id": row[0],
@@ -376,7 +744,12 @@ async def get_character_inventory(character_id: int):
                     "value": row[4],
                     "quantity": row[5],
                     "equipped": row[6],
-                    "slot": row[7]
+                    "slot": _normalize_equipment_slot(row[7]),
+                    "description": row[8],
+                    "damage_min": row[9],
+                    "damage_max": row[10],
+                    "armor_class": row[11],
+                    "health_recovery": row[12],
                 }
                 for row in item_rows
             ]
@@ -389,6 +762,176 @@ async def get_character_inventory(character_id: int):
             detail=str(e)
         )
 
+
+@router.post("/characters/{character_id}/inventory/equip", response_model=dict)
+async def equip_inventory_item(
+    character_id: int,
+    payload: EquipItemModel,
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """Equip one item from backpack into its equipment slot."""
+    try:
+        ensure_character_owner(character_id, current_user_id)
+
+        item = fetch_one(
+            "SELECT id, name, item_type, COALESCE(description, '') FROM items WHERE id = %s",
+            payload.item_id,
+        )
+        if not item:
+            raise HTTPException(status_code=404, detail="Item not found")
+
+        slot = _resolve_equipment_slot(item[2])
+        if not slot:
+            raise HTTPException(status_code=400, detail="This item cannot be equipped")
+
+        is_two_handed = _is_two_handed_item(item[2], item[1], item[3])
+
+        resolved_slot = slot
+        conflict_slots = [slot]
+        if slot == "right_hand":
+            conflict_slots = ["right_hand", "both_hands"]
+            if is_two_handed:
+                resolved_slot = "both_hands"
+                conflict_slots = ["right_hand", "left_hand", "both_hands"]
+        elif slot == "left_hand":
+            conflict_slots = ["left_hand", "both_hands"]
+        elif slot == "ring":
+            left_ring = fetch_one(
+                "SELECT id FROM inventory WHERE character_id = %s AND equipped = TRUE AND slot = 'ring_left' LIMIT 1",
+                character_id,
+            )
+            right_ring = fetch_one(
+                "SELECT id FROM inventory WHERE character_id = %s AND equipped = TRUE AND slot = 'ring_right' LIMIT 1",
+                character_id,
+            )
+            if not left_ring:
+                resolved_slot = "ring_left"
+                conflict_slots = ["ring_left"]
+            elif not right_ring:
+                resolved_slot = "ring_right"
+                conflict_slots = ["ring_right"]
+            else:
+                resolved_slot = "ring_left"
+                conflict_slots = ["ring_left"]
+
+        bag_row = fetch_one(
+            """
+            SELECT id, quantity
+            FROM inventory
+                        WHERE character_id = %s
+                            AND item_id = %s
+                            AND equipped = FALSE
+                            AND COALESCE(slot, '') NOT IN ('right_hand', 'left_hand', 'both_hands', 'head', 'chest', 'legs', 'feet', 'ring_left', 'ring_right', 'main_hand', 'off_hand', 'body', 'torso')
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            character_id,
+            payload.item_id,
+        )
+        if not bag_row or int(bag_row[1] or 0) <= 0:
+            raise HTTPException(status_code=400, detail="Item is not in backpack")
+
+        # Unequip conflicting equipped item(s), if any.
+        expanded_conflict_slots = []
+        for conflict_slot in conflict_slots:
+            expanded_conflict_slots.extend(_slot_aliases_for_query(conflict_slot))
+
+        current_equipped = fetch_all(
+            "SELECT id, item_id FROM inventory WHERE character_id = %s AND equipped = TRUE AND slot = ANY(%s)",
+            character_id,
+            list(dict.fromkeys(expanded_conflict_slots)),
+        )
+        for equipped_row in current_equipped:
+            _inventory_add(character_id, int(equipped_row[1]), 1)
+            execute("DELETE FROM inventory WHERE id = %s", equipped_row[0])
+
+        if int(bag_row[1]) > 1:
+            execute("UPDATE inventory SET quantity = quantity - 1 WHERE id = %s", bag_row[0])
+        else:
+            execute("DELETE FROM inventory WHERE id = %s", bag_row[0])
+
+        # Remove stale non-equipped rows with the same item/slot from legacy data.
+        execute(
+            "DELETE FROM inventory WHERE character_id = %s AND item_id = %s AND equipped = FALSE AND slot = %s",
+            character_id,
+            payload.item_id,
+            resolved_slot,
+        )
+
+        execute(
+            """
+            INSERT INTO inventory (character_id, item_id, quantity, equipped, slot)
+            VALUES (%s, %s, 1, TRUE, %s)
+            """,
+            character_id,
+            payload.item_id,
+            resolved_slot,
+        )
+
+        return {
+            "status": "equipped",
+            "slot": resolved_slot,
+            "item_id": payload.item_id,
+            "two_handed": is_two_handed,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/characters/{character_id}/inventory/unequip", response_model=dict)
+async def unequip_inventory_item(
+    character_id: int,
+    payload: UnequipItemModel,
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """Unequip item from slot back to backpack."""
+    try:
+        ensure_character_owner(character_id, current_user_id)
+
+        normalized_slot = (payload.slot or "").strip().lower()
+        if normalized_slot in {"right_hand", "left_hand"}:
+            aliases = _slot_aliases_for_query(normalized_slot)
+            equipped_row = fetch_one(
+                "SELECT id, item_id FROM inventory WHERE character_id = %s AND equipped = TRUE AND slot = ANY(%s) LIMIT 1",
+                character_id,
+                aliases + ["both_hands"],
+            )
+        else:
+            aliases = _slot_aliases_for_query(normalized_slot)
+            equipped_row = fetch_one(
+                "SELECT id, item_id FROM inventory WHERE character_id = %s AND equipped = TRUE AND slot = ANY(%s) LIMIT 1",
+                character_id,
+                aliases,
+            )
+        if not equipped_row:
+            raise HTTPException(status_code=404, detail="No equipped item in this slot")
+
+        _inventory_add(character_id, int(equipped_row[1]), 1)
+        execute("DELETE FROM inventory WHERE id = %s", equipped_row[0])
+        return {"status": "unequipped", "slot": normalized_slot}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/characters/{character_id}/starter-items/ensure", response_model=dict)
+async def ensure_character_starter_items(character_id: int, current_user_id: int = Depends(get_current_user_id)):
+    """Manual endpoint to backfill starter items if missing."""
+    try:
+        ensure_character_owner(character_id, current_user_id)
+        exists = fetch_one("SELECT id FROM characters WHERE id = %s", character_id)
+        if not exists:
+            raise HTTPException(status_code=404, detail="Character not found")
+        granted = _ensure_starter_pack(character_id)
+        return {"status": "success", "granted": granted}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ===== Players (online) =====
 @router.get("/players/online_count", response_model=dict)
 async def get_online_players_count():
@@ -400,10 +943,12 @@ async def get_online_players_count():
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/auth/logout", response_model=dict)
-async def logout(user_id: int):
+async def logout(user_id: int = None, current_user_id: int = Depends(get_current_user_id)):
     """Mark user's characters as offline (MVP)"""
     try:
-        execute("UPDATE characters SET is_online = FALSE WHERE user_id = %s", user_id)
+        target_user_id = user_id or current_user_id
+        ensure_user_matches(target_user_id, current_user_id)
+        execute("UPDATE characters SET is_online = FALSE WHERE user_id = %s", target_user_id)
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -486,20 +1031,34 @@ async def list_locations():
 
 # ===== World (current location & movement) =====
 @router.get("/world/current", response_model=dict)
-async def world_current(character_id: int):
+async def world_current(character_id: int, current_user_id: int = Depends(get_current_user_id)):
     """Get current location for character with objects"""
     try:
+        ensure_character_owner(character_id, current_user_id)
+
         # Ensure character has a location (default to Элдория - location_id 1)
         char_location = fetch_one(
-            "SELECT current_location_id FROM characters WHERE id = %s",
+            "SELECT current_location_id, current_zone_id, position_x, position_y, COALESCE(position_z, 0) FROM characters WHERE id = %s",
             character_id
         )
         
         if not char_location or char_location[0] is None:
-            execute("UPDATE characters SET current_location_id = 1, position_x = 0, position_y = 0 WHERE id = %s", character_id)
+            default_zone = fetch_one("SELECT id FROM mob_spawn_zones WHERE location_id = 1 ORDER BY id LIMIT 1")
+            default_zone_id = int(default_zone[0]) if default_zone else None
+            execute(
+                "UPDATE characters SET current_location_id = 1, current_zone_id = %s, position_x = 0, position_y = 0, position_z = 0 WHERE id = %s",
+                default_zone_id,
+                character_id,
+            )
             location_id = 1
+            zone_id = default_zone_id
+            pos_x, pos_y, pos_z = 0, 0, 0
         else:
             location_id = char_location[0]
+            zone_id = char_location[1]
+            pos_x = float(char_location[2] or 0)
+            pos_y = float(char_location[3] or 0)
+            pos_z = float(char_location[4] or 0)
         
         # Get location info
         loc = fetch_one(
@@ -517,7 +1076,13 @@ async def world_current(character_id: int):
                 "description": loc[2],
                 "type": loc[3],
                 "danger_level": loc[4],
-            }
+            },
+            "zone": {
+                "id": zone_id,
+                "name": fetch_val("SELECT zone_name FROM mob_spawn_zones WHERE id = %s", zone_id) if zone_id else None,
+                "type": fetch_val("SELECT zone_type FROM mob_spawn_zones WHERE id = %s", zone_id) if zone_id else None,
+            },
+            "character_position": {"x": pos_x, "y": pos_y, "z": pos_z},
         }
     except HTTPException:
         raise
@@ -525,32 +1090,44 @@ async def world_current(character_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/world/mobs", response_model=dict)
-async def get_mobs_in_location(character_id: int):
+async def get_mobs_in_location(character_id: int, current_user_id: int = Depends(get_current_user_id)):
     """Get mobs in character's current location"""
     try:
+        ensure_character_owner(character_id, current_user_id)
+
         # Get current location
         location_row = fetch_one(
-            "SELECT current_location_id FROM characters WHERE id = %s",
+            "SELECT current_location_id, current_zone_id FROM characters WHERE id = %s",
             character_id
         )
         if not location_row or not location_row[0]:
             # Default to Элдория
-            execute("UPDATE characters SET current_location_id = 1 WHERE id = %s", character_id)
+            default_zone = fetch_one("SELECT id FROM mob_spawn_zones WHERE location_id = 1 ORDER BY id LIMIT 1")
+            default_zone_id = int(default_zone[0]) if default_zone else None
+            execute("UPDATE characters SET current_location_id = 1, current_zone_id = %s, position_z = COALESCE(position_z, 0) WHERE id = %s", default_zone_id, character_id)
             location_id = 1
+            zone_id = default_zone_id
         else:
             location_id = location_row[0]
+            zone_id = location_row[1]
         
-        # Get mobs in location
-        mobs = fetch_all(
-            """
-            SELECT id, name, level, health_points, max_health_points, damage_min, damage_max, 
-                   armor_class, experience_reward, gold_reward, mob_type, aggression_type
-            FROM mobs 
-            WHERE location_id = %s AND health_points > 0
-            ORDER BY level ASC, name ASC
-            """,
-            location_id
-        )
+        # Mobs are shown for the currently entered zone only.
+        mobs = []
+        if zone_id:
+            mobs = fetch_all(
+                """
+                SELECT m.id, m.name, m.level, m.health_points, m.max_health_points, m.damage_min, m.damage_max,
+                       m.armor_class, m.experience_reward, m.gold_reward, m.mob_type, m.aggression_type
+                FROM mob_zone_spawns mzs
+                JOIN mobs m ON m.id = mzs.mob_id
+                WHERE mzs.spawn_zone_id = %s
+                  AND m.location_id = %s
+                  AND m.health_points > 0
+                ORDER BY m.level ASC, m.name ASC
+                """,
+                zone_id,
+                location_id,
+            )
         
         return {
             "mobs": [
@@ -570,7 +1147,8 @@ async def get_mobs_in_location(character_id: int):
                 }
                 for m in mobs
             ],
-            "location_id": location_id
+            "location_id": location_id,
+            "zone_id": zone_id,
         }
     except HTTPException:
         raise
@@ -704,28 +1282,62 @@ async def escape_combat(character_id: int):
 
 # ===== Crafting (STUB) =====
 @router.get("/crafting/recipes", response_model=dict)
-async def get_recipes():
+async def get_recipes(character_id: int = None, current_user_id: int = Depends(get_current_user_id)):
     """Get available crafting recipes"""
     try:
+        if character_id is not None:
+            ensure_character_owner(character_id, current_user_id)
+
         recipes = fetch_all(
             """
-            SELECT id, crafting_type, result_item_id, required_skill_level, crafting_time_seconds
-            FROM crafting_recipes
+            SELECT cr.id, cr.crafting_type, cr.result_item_id, cr.required_skill_level,
+                   cr.crafting_time_seconds, cr.result_quantity, cr.required_materials,
+                   cr.success_rate, i.name
+            FROM crafting_recipes cr
+            JOIN items i ON i.id = cr.result_item_id
+            ORDER BY cr.required_skill_level, cr.id
             """
         )
         
-        return {
-            "count": len(recipes),
-            "recipes": [
+        recipe_items = []
+        for r in recipes:
+            required_materials = json.loads(r[6]) if r[6] else []
+            enriched_materials = []
+            can_craft = True
+            for mat in required_materials:
+                item_id = int(mat.get("item_id", 0))
+                required_qty = int(mat.get("quantity", 0))
+                item_name = fetch_val("SELECT name FROM items WHERE id = %s", item_id) or f"item_{item_id}"
+                have_qty = _inventory_count(character_id, item_id) if character_id is not None else None
+                if character_id is not None and have_qty < required_qty:
+                    can_craft = False
+                enriched_materials.append(
+                    {
+                        "item_id": item_id,
+                        "item_name": item_name,
+                        "quantity": required_qty,
+                        "have": have_qty,
+                    }
+                )
+
+            recipe_items.append(
                 {
                     "id": r[0],
                     "type": r[1],
                     "result_item_id": r[2],
                     "skill_level_required": r[3],
-                    "crafting_time_seconds": r[4]
+                    "crafting_time_seconds": r[4],
+                    "result_quantity": r[5],
+                    "required_materials": enriched_materials,
+                    "success_rate": r[7],
+                    "result_item_name": r[8],
+                    "can_craft": can_craft if character_id is not None else None,
                 }
-                for r in recipes
-            ]
+            )
+
+        return {
+            "count": len(recipes),
+            "recipes": recipe_items,
         }
     except Exception as e:
         raise HTTPException(
@@ -734,7 +1346,7 @@ async def get_recipes():
         )
 
 @router.post("/crafting/craft", response_model=dict)
-async def craft_item(character_id: int, recipe_id: int):
+async def craft_item(character_id: int, recipe_id: int, current_user_id: int = Depends(get_current_user_id)):
     """
     Craft an item
     
@@ -744,10 +1356,86 @@ async def craft_item(character_id: int, recipe_id: int):
     - Success rate based on skill level
     - Experience reward on completion
     """
+    ensure_character_owner(character_id, current_user_id)
+
+    recipe = fetch_one(
+        """
+        SELECT cr.id, cr.result_item_id, cr.result_quantity, cr.required_skill_level,
+               cr.required_materials, cr.success_rate, i.name
+        FROM crafting_recipes cr
+        JOIN items i ON i.id = cr.result_item_id
+        WHERE cr.id = %s
+        """,
+        recipe_id,
+    )
+    if not recipe:
+        raise HTTPException(status_code=404, detail="Recipe not found")
+
+    materials = json.loads(recipe[4]) if recipe[4] else []
+    if not isinstance(materials, list):
+        raise HTTPException(status_code=500, detail="Recipe materials are malformed")
+
+    missing = []
+    for mat in materials:
+        item_id = int(mat.get("item_id", 0))
+        needed_qty = int(mat.get("quantity", 0))
+        if item_id <= 0 or needed_qty <= 0:
+            continue
+        have_qty = _inventory_count(character_id, item_id)
+        if have_qty < needed_qty:
+            item_name = fetch_val("SELECT name FROM items WHERE id = %s", item_id) or f"item_{item_id}"
+            missing.append({"item_id": item_id, "item_name": item_name, "required": needed_qty, "have": have_qty})
+
+    if missing:
+        return {"status": "missing_materials", "missing": missing}
+
+    for mat in materials:
+        item_id = int(mat.get("item_id", 0))
+        needed_qty = int(mat.get("quantity", 0))
+        if item_id > 0 and needed_qty > 0:
+            _inventory_remove(character_id, item_id, needed_qty)
+
+    success_rate = max(1, min(100, int(recipe[5] or 100)))
+    is_success = (random.random() * 100) <= success_rate
+
+    crafted_qty = int(recipe[2] or 1) if is_success else 0
+    bonus_proc = False
+    if is_success and random.random() < 0.12:
+        crafted_qty += 1
+        bonus_proc = True
+
+    if crafted_qty > 0:
+        _inventory_add(character_id, int(recipe[1]), crafted_qty)
+
+    crafting_record = fetch_one(
+        "SELECT id FROM character_crafting WHERE character_id = %s AND recipe_id = %s",
+        character_id,
+        recipe_id,
+    )
+    if crafting_record:
+        execute(
+            "UPDATE character_crafting SET items_crafted = items_crafted + %s, last_crafted_at = CURRENT_TIMESTAMP WHERE id = %s",
+            crafted_qty,
+            crafting_record[0],
+        )
+    else:
+        execute(
+            "INSERT INTO character_crafting (character_id, recipe_id, skill_level, items_crafted, last_crafted_at) VALUES (%s, %s, 1, %s, CURRENT_TIMESTAMP)",
+            character_id,
+            recipe_id,
+            crafted_qty,
+        )
+
     return {
-        "status": "crafting_started",
-        "message": "Crafting mechanics coming soon (MVP)",
-        "recipe_id": recipe_id
+        "status": "crafted" if is_success else "craft_failed",
+        "recipe_id": recipe_id,
+        "success_rate": success_rate,
+        "result_item_id": int(recipe[1]),
+        "result_item_name": recipe[6],
+        "result_quantity": crafted_qty,
+        "bonus_proc": bonus_proc,
+        "materials_spent": materials,
+        "note": "Вдохновение мастера: иногда создается +1 предмет" if bonus_proc else "",
     }
 
 # ===== Quests (STUB) =====
@@ -838,9 +1526,11 @@ async def send_chat_message(sender_id: int, message: str, chat_type: str = "loca
 
 # ===== QUESTS (Квесты) =====
 @router.get("/quests/available", response_model=dict)
-async def get_available_quests(location_id: int, character_id: int):
+async def get_available_quests(location_id: int, character_id: int, current_user_id: int = Depends(get_current_user_id)):
     """Get available quests from NPCs in location"""
     try:
+        ensure_character_owner(character_id, current_user_id)
+
         quests = fetch_all("""
             SELECT  q.id, q.title, q.description, q.quest_type, q.level_requirement, 
                    q.reward_experience, q.reward_gold, n.name as npc_name
@@ -875,9 +1565,15 @@ async def get_available_quests(location_id: int, character_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/quests/{quest_id}/accept", response_model=dict)
-async def accept_quest(quest_id: int, character_id: int):
+async def accept_quest(quest_id: int, character_id: int, current_user_id: int = Depends(get_current_user_id)):
     """Accept a quest"""
     try:
+        ensure_character_owner(character_id, current_user_id)
+
+        quest_exists = fetch_one("SELECT id FROM quests WHERE id = %s AND is_available = TRUE", quest_id)
+        if not quest_exists:
+            raise HTTPException(status_code=404, detail="Quest not found")
+
         # Check if already active
         existing = fetch_one(
             "SELECT id FROM character_quests WHERE character_id = %s AND quest_id = %s AND status = 'active'",
@@ -886,6 +1582,15 @@ async def accept_quest(quest_id: int, character_id: int):
         if existing:
             return {"status": "already_active", "message": "This quest is already active"}
         
+        # Block duplicate rewards for already completed quests.
+        done = fetch_one(
+            "SELECT id FROM character_quests WHERE character_id = %s AND quest_id = %s AND status = 'completed'",
+            character_id,
+            quest_id,
+        )
+        if done:
+            return {"status": "already_completed", "message": "Quest already completed"}
+
         # Add quest to character
         execute(
             "INSERT INTO character_quests (character_id, quest_id, status, progress_data) VALUES (%s, %s, 'active', '{}')",
@@ -897,9 +1602,11 @@ async def accept_quest(quest_id: int, character_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/quests/{character_id}/active", response_model=dict)
-async def get_active_quests(character_id: int):
+async def get_active_quests(character_id: int, current_user_id: int = Depends(get_current_user_id)):
     """Get active quests for character"""
     try:
+        ensure_character_owner(character_id, current_user_id)
+
         quests = fetch_all("""
             SELECT cq.id, q.id, q.title, q.description, q.quest_type, q.reward_experience, q.reward_gold,
                    cq.status, cq.progress_data
@@ -939,9 +1646,27 @@ async def get_active_quests(character_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/quests/{character_id}/kill", response_model=dict)
-async def report_kill(character_id: int, quest_id: int, mob_id: int):
+async def report_kill(character_id: int, quest_id: int, mob_id: int, current_user_id: int = Depends(get_current_user_id)):
     """Report killing a mob for quest"""
     try:
+        ensure_character_owner(character_id, current_user_id)
+
+        active = fetch_one(
+            "SELECT id FROM character_quests WHERE character_id = %s AND quest_id = %s AND status = 'active'",
+            character_id,
+            quest_id,
+        )
+        if not active:
+            raise HTTPException(status_code=400, detail="Quest is not active")
+
+        target = fetch_one(
+            "SELECT id FROM quest_kill_targets WHERE quest_id = %s AND mob_id = %s",
+            quest_id,
+            mob_id,
+        )
+        if not target:
+            raise HTTPException(status_code=400, detail="Mob is not a target for this quest")
+
         # Update kill count
         existing = fetch_one(
             "SELECT id, kill_count FROM character_quest_kills WHERE character_id = %s AND quest_id = %s AND mob_id = %s",
@@ -962,13 +1687,23 @@ async def report_kill(character_id: int, quest_id: int, mob_id: int):
             new_count = 1
         
         return {"status": "kill_reported", "new_count": new_count}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/quests/{character_id}/collect", response_model=dict)
-async def report_item_collection(character_id: int, quest_id: int, item_id: int, quantity: int = 1):
+async def report_item_collection(
+    character_id: int,
+    quest_id: int,
+    item_id: int,
+    quantity: int = 1,
+    current_user_id: int = Depends(get_current_user_id),
+):
     """Report collecting an item for quest (e.g., stones, bones, skins, etc.)"""
     try:
+        ensure_character_owner(character_id, current_user_id)
+
         import json
         
         # Get current quest progress
@@ -1013,9 +1748,11 @@ async def report_item_collection(character_id: int, quest_id: int, item_id: int,
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/quests/{character_id}/{quest_id}/progress", response_model=dict)
-async def get_quest_progress(character_id: int, quest_id: int):
+async def get_quest_progress(character_id: int, quest_id: int, current_user_id: int = Depends(get_current_user_id)):
     """Get detailed progress for a quest"""
     try:
+        ensure_character_owner(character_id, current_user_id)
+
         import json
         
         # Get quest and progress
@@ -1086,26 +1823,53 @@ async def get_quest_progress(character_id: int, quest_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/quests/{character_id}/complete", response_model=dict)
-async def complete_quest(character_id: int, quest_id: int):
+async def complete_quest(character_id: int, quest_id: int, current_user_id: int = Depends(get_current_user_id)):
     """Complete a quest and get rewards"""
     try:
+        ensure_character_owner(character_id, current_user_id)
+
+        quest_state = fetch_one(
+            "SELECT status FROM character_quests WHERE character_id = %s AND quest_id = %s",
+            character_id,
+            quest_id,
+        )
+        if not quest_state:
+            raise HTTPException(status_code=404, detail="Quest is not accepted")
+        if quest_state[0] != 'active':
+            raise HTTPException(status_code=400, detail="Quest is not active")
+
         # Get quest details
         quest = fetch_one(
-            """SELECT reward_experience, reward_gold FROM quests WHERE id = %s""",
+            """SELECT reward_experience, reward_gold, quest_type, level_requirement FROM quests WHERE id = %s""",
             quest_id
         )
         
         if not quest:
             raise HTTPException(status_code=404, detail="Quest not found")
         
-        # Update character stats
-        execute(
-            "UPDATE characters SET experience = experience + %s, gold = COALESCE(gold, 0) + %s WHERE id = %s",
-            quest[0], quest[1], character_id
-        )
+        # Validate completion conditions for kill quests.
+        if quest[2] == 'kill':
+            pending = fetch_val(
+                """
+                SELECT COUNT(*)
+                FROM quest_kill_targets qkt
+                LEFT JOIN character_quest_kills cqk
+                    ON cqk.quest_id = qkt.quest_id
+                    AND cqk.mob_id = qkt.mob_id
+                    AND cqk.character_id = %s
+                WHERE qkt.quest_id = %s
+                    AND COALESCE(cqk.kill_count, 0) < qkt.required_count
+                """,
+                character_id,
+                quest_id,
+            )
+            if (pending or 0) > 0:
+                raise HTTPException(status_code=400, detail="Quest objectives are not completed")
+
+        progression = apply_experience_and_level_up(character_id, int(quest[0] or 0), int(quest[1] or 0))
         
-        # Add skill coins reward
-        coin_reward = max(10, quest[0] // 50)  # Based on experience reward
+        # Add honor coins reward (1-5) based on quest complexity.
+        coin_reward = _honor_reward_for_quest(int(quest[3] or 1), quest[2])
         existing_coins = fetch_one(
             "SELECT id FROM skill_coins WHERE character_id = %s",
             character_id
@@ -1121,21 +1885,37 @@ async def complete_quest(character_id: int, quest_id: int):
                 "INSERT INTO skill_coins (character_id, balance, total_earned) VALUES (%s, %s, %s)",
                 character_id, coin_reward, coin_reward
             )
+
+        execute(
+            "INSERT INTO skill_coin_transactions (character_id, transaction_type, amount, source, description) VALUES (%s, 'earned', %s, %s, %s)",
+            character_id,
+            coin_reward,
+            f"quest_{quest_id}",
+            "Награда за завершение квеста",
+        )
         
         # Mark quest as completed
-        execute(
-            "UPDATE character_quests SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE character_id = %s AND quest_id = %s",
-            character_id, quest_id
+        updated = execute(
+            "UPDATE character_quests SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE character_id = %s AND quest_id = %s AND status = 'active'",
+            character_id,
+            quest_id,
         )
+        if updated == 0:
+            raise HTTPException(status_code=400, detail="Quest is not active")
         
         return {
             "status": "quest_completed",
             "experience_reward": quest[0],
             "gold_reward": quest[1],
-            "skill_coins_reward": coin_reward
+            "skill_coins_reward": coin_reward,
+            "honor_points_reward": coin_reward,
+            "new_level": progression["level"],
+            "leveled_up": progression["leveled_up"]
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to complete quest")
 
 # ===== NPCs (Информация о НПС и их квестах) =====
 @router.get("/npcs/{npc_id}", response_model=dict)
@@ -1254,17 +2034,22 @@ async def get_location_npcs(location_id: int, character_id: int):
 
 # ===== CRAFTING & BUTCHERING (Разделка и крафт) =====
 @router.post("/butchering/butcher_mob", response_model=dict)
-async def butcher_mob(character_id: int, mob_id: int):
+async def butcher_mob(character_id: int, mob_id: int, current_user_id: int = Depends(get_current_user_id)):
     """Butcher a killed mob and gain loot"""
     try:
+        ensure_character_owner(character_id, current_user_id)
+
         # Get mob loot table
         mob = fetch_one(
-            "SELECT loot_table_id FROM mobs WHERE id = %s",
+            "SELECT loot_table_id, health_points FROM mobs WHERE id = %s",
             mob_id
         )
         
         if not mob or not mob[0]:
             return {"status": "no_loot", "message": "This mob has no loot"}
+
+        if int(mob[1] or 0) > 0:
+            return {"status": "mob_alive", "message": "Mob must be defeated before butchering"}
         
         # Get loot items from table
         loot_items = fetch_all("""
@@ -1284,6 +2069,7 @@ async def butcher_mob(character_id: int, mob_id: int):
                     INSERT INTO mob_loot (character_id, mob_id, item_id, quantity, is_butchered)
                     VALUES (%s, %s, %s, %s, TRUE)
                 """, character_id, mob_id, item_id, quantity)
+                _inventory_add(character_id, item_id, quantity)
                 
                 # Get item name
                 item = fetch_one("SELECT name FROM items WHERE id = %s", item_id)
@@ -1316,9 +2102,11 @@ async def butcher_mob(character_id: int, mob_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/butchering/{character_id}/skill", response_model=dict)
-async def get_butchering_skill(character_id: int):
+async def get_butchering_skill(character_id: int, current_user_id: int = Depends(get_current_user_id)):
     """Get character's butchering skill info"""
     try:
+        ensure_character_owner(character_id, current_user_id)
+
         skill = fetch_one("""
             SELECT skill_level, experience, experience_next_level, items_butchered
             FROM butchering_skill
@@ -1342,11 +2130,63 @@ async def get_butchering_skill(character_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ===== SKILL COINS (Коины умений) =====
-@router.get("/skill_coins/{character_id}", response_model=dict)
-async def get_skill_coins(character_id: int):
-    """Get character's skill coins balance"""
+
+@router.get("/loot/starter-zone", response_model=dict)
+async def get_starter_zone_loot_table():
+    """Return starter-zone mobs and their configured loot tables."""
     try:
+        rows = fetch_all(
+            """
+            SELECT m.id, m.name, m.level, m.location_id,
+                   COALESCE(lt.name, 'Без таблицы лута') AS loot_table_name,
+                   i.id AS item_id, i.name AS item_name,
+                   li.drop_chance, li.min_quantity, li.max_quantity
+            FROM mobs m
+            LEFT JOIN loot_tables lt ON lt.id = m.loot_table_id
+            LEFT JOIN loot_items li ON li.loot_table_id = lt.id
+            LEFT JOIN items i ON i.id = li.item_id
+            WHERE m.location_id IN (1, 2)
+            ORDER BY m.location_id, m.level, m.name, i.name
+            """
+        )
+
+        mobs = {}
+        for row in rows:
+            mob_id = row[0]
+            if mob_id not in mobs:
+                mobs[mob_id] = {
+                    "mob_id": mob_id,
+                    "mob_name": row[1],
+                    "level": row[2],
+                    "location_id": row[3],
+                    "loot_table": row[4],
+                    "loot_items": [],
+                }
+            if row[5] is not None:
+                mobs[mob_id]["loot_items"].append(
+                    {
+                        "item_id": row[5],
+                        "item_name": row[6],
+                        "drop_chance": float(row[7]),
+                        "min_quantity": row[8],
+                        "max_quantity": row[9],
+                    }
+                )
+
+        return {
+            "count": len(mobs),
+            "mobs": list(mobs.values()),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ===== HONOR COINS (Коины чести) =====
+@router.get("/skill_coins/{character_id}", response_model=dict)
+async def get_skill_coins(character_id: int, current_user_id: int = Depends(get_current_user_id)):
+    """Get character honor coins balance."""
+    try:
+        ensure_character_owner(character_id, current_user_id)
+
         coins = fetch_one("""
             SELECT balance, total_earned, total_spent
             FROM skill_coins
@@ -1363,6 +2203,7 @@ async def get_skill_coins(character_id: int):
         
         return {
             "balance": coins[0],
+            "honor_points": coins[0],
             "total_earned": coins[1],
             "total_spent": coins[2]
         }
@@ -1370,69 +2211,131 @@ async def get_skill_coins(character_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/abilities/{ability_id}/learn", response_model=dict)
-async def learn_ability_with_coins(character_id: int, ability_id: int):
-    """Learn an ability using skill coins"""
+async def learn_ability_with_coins(
+    character_id: int,
+    ability_id: int,
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """Learn an ability using honor points earned from quests."""
     try:
-        # Check if already learned
+        ensure_character_owner(character_id, current_user_id)
+
+        # Check if already learned in either tracking table or active abilities table.
         learned = fetch_one(
-            "SELECT id FROM character_learned_abilities WHERE character_id = %s AND ability_id = %s",
-            character_id, ability_id
+            "SELECT id FROM character_abilities WHERE character_id = %s AND ability_id = %s",
+            character_id,
+            ability_id,
         )
-        
         if learned:
             return {"status": "already_learned", "message": "You already know this ability"}
-        
-        # Get skill coin cost
-        cost = fetch_one(
-            """SELECT skill_coin_cost, unlocked_at_level FROM ability_skill_coin_costs 
-               WHERE ability_id = %s""",
+
+        # Character data for constraints.
+        char = fetch_one(
+            """
+            SELECT c.level, c.class_id, r.name, cc.name
+            FROM characters c
+            LEFT JOIN races r ON r.id = c.race_id
+            LEFT JOIN character_classes cc ON cc.id = c.class_id
+            WHERE c.id = %s
+            """,
+            character_id,
+        )
+        if not char:
+            raise HTTPException(status_code=404, detail="Character not found")
+        char_level, char_class_id, race_name, class_name = char
+
+        ability = fetch_one(
+            "SELECT id, name, class_id, level_requirement FROM abilities WHERE id = %s",
             ability_id
         )
-        
-        if not cost or cost[0] == 0:
-            return {"status": "free_ability", "message": "This ability cannot be purchased"}
-        
-        coin_cost = cost[0]
-        
-        # Check character level
-        character = fetch_one(
-            "SELECT level FROM characters WHERE id = %s",
-            character_id
+        if not ability:
+            raise HTTPException(status_code=404, detail="Ability not found")
+
+        ability_name = ability[1] or ""
+        ability_class_id = ability[2]
+
+        # Basic class compatibility.
+        if ability_class_id and char_class_id and int(ability_class_id) != int(char_class_id):
+            raise HTTPException(status_code=400, detail="Ability belongs to another class")
+
+        # Race/class unique compatibility by naming convention.
+        if race_name and class_name:
+            race_prefix = f"{race_name}:"
+            race_class_prefix = f"{race_name} {class_name}:"
+            if ":" in ability_name and not (
+                ability_name.startswith(race_prefix) or ability_name.startswith(race_class_prefix)
+            ):
+                raise HTTPException(status_code=400, detail="Ability is not available for this race/class")
+
+        cost = fetch_one(
+            """
+            SELECT skill_coin_cost, unlocked_at_level, COALESCE(required_completed_quests, 0)
+            FROM ability_skill_coin_costs
+            WHERE ability_id = %s
+            """,
+            ability_id,
         )
-        
-        if character[0] < cost[1]:
-            return {"status": "low_level", "message": f"Character must be level {cost[1]}"}
-        
-        # Check balance
+        default_required_level = int(ability[3] or 1)
+        coin_cost = int(cost[0] or 10) if cost else 10
+        required_level = int(cost[1] or default_required_level) if cost else default_required_level
+        required_quests = int(cost[2] or 0) if cost else 0
+
+        if int(char_level or 1) < required_level:
+            return {"status": "low_level", "message": f"Character must be level {required_level}"}
+
+        completed_quests = int(
+            fetch_val(
+                "SELECT COUNT(*) FROM character_quests WHERE character_id = %s AND status = 'completed'",
+                character_id,
+            )
+            or 0
+        )
+        if completed_quests < required_quests:
+            return {
+                "status": "not_enough_quests",
+                "message": f"Нужно завершить квестов: {required_quests}",
+            }
+
         coins = fetch_one(
             "SELECT balance FROM skill_coins WHERE character_id = %s",
             character_id
         )
-        
-        if not coins or coins[0] < coin_cost:
-            return {"status": "insufficient_coins", "message": "Not enough skill coins"}
-        
-        # Deduct coins and add ability
+
+        if not coins or int(coins[0] or 0) < coin_cost:
+            return {"status": "insufficient_coins", "message": "Not enough honor points"}
+
+        # Deduct honor points.
         execute(
             "UPDATE skill_coins SET balance = balance - %s, total_spent = total_spent + %s WHERE character_id = %s",
             coin_cost, coin_cost, character_id
         )
-        
+
+        # Persist both as learned marker and active character ability.
         execute(
-            "INSERT INTO character_learned_abilities (character_id, ability_id) VALUES (%s, %s)",
+            "INSERT INTO character_learned_abilities (character_id, ability_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
             character_id, ability_id
         )
-        
+        execute(
+            "INSERT INTO character_abilities (character_id, ability_id, level, cooldown_remaining) VALUES (%s, %s, 1, 0) ON CONFLICT DO NOTHING",
+            character_id,
+            ability_id,
+        )
+
         # Log transaction
         execute(
             "INSERT INTO skill_coin_transactions (character_id, transaction_type, amount, source, description) VALUES (%s, 'spent', %s, %s, 'Learned ability')",
             character_id, coin_cost, f"ability_{ability_id}"
         )
-        
+
+        new_balance = int(fetch_val("SELECT balance FROM skill_coins WHERE character_id = %s", character_id) or 0)
+
         return {
             "status": "ability_learned",
             "ability_id": ability_id,
-            "coins_spent": coin_cost
+            "ability_name": ability_name,
+            "coins_spent": coin_cost,
+            "honor_points_spent": coin_cost,
+            "honor_points_balance": new_balance,
         }
     except HTTPException:
         raise
@@ -1440,44 +2343,98 @@ async def learn_ability_with_coins(character_id: int, ability_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/abilities/{character_id}/purchasable", response_model=dict)
-async def get_purchasable_abilities(character_id: int):
-    """Get abilities that can be purchased with skill coins"""
+async def get_purchasable_abilities(character_id: int, current_user_id: int = Depends(get_current_user_id)):
+    """Get race/class purchasable abilities for honor points."""
     try:
-        # Get character level and class
+        ensure_character_owner(character_id, current_user_id)
+
+        # Character context.
         char_data = fetch_one(
-            "SELECT level, class_id FROM characters WHERE id = %s",
+            """
+            SELECT c.level, c.class_id, r.name, cc.name
+            FROM characters c
+            LEFT JOIN races r ON r.id = c.race_id
+            LEFT JOIN character_classes cc ON cc.id = c.class_id
+            WHERE c.id = %s
+            """,
             character_id
         )
-        
-        # Get already learned abilities
-        learned = fetch_all(
-            "SELECT ability_id FROM character_learned_abilities WHERE character_id = %s",
-            character_id
+        if not char_data:
+            raise HTTPException(status_code=404, detail="Character not found")
+        level, class_id, race_name, class_name = char_data
+
+        # Keep this endpoint centered on race+class identity skills.
+        race_class_prefix = f"{race_name} {class_name}:" if race_name and class_name else ""
+        race_prefix = f"{race_name}:" if race_name else ""
+
+        learned_ids = {
+            row[0]
+            for row in fetch_all("SELECT ability_id FROM character_abilities WHERE character_id = %s", character_id)
+        }
+
+        coin_balance = int(fetch_val("SELECT COALESCE(balance, 0) FROM skill_coins WHERE character_id = %s", character_id) or 0)
+        completed_quests = int(
+            fetch_val(
+                "SELECT COUNT(*) FROM character_quests WHERE character_id = %s AND status = 'completed'",
+                character_id,
+            )
+            or 0
         )
-        learned_ids = [a[0] for a in learned]
-        
-        # Get purchasable abilities
+
         abilities = fetch_all("""
-            SELECT a.id, a.name, a.description, ascc.skill_coin_cost, ascc.unlocked_at_level
+            SELECT a.id, a.name, a.description, a.class_id,
+                COALESCE(ascc.skill_coin_cost, 10) AS cost,
+                COALESCE(ascc.unlocked_at_level, a.level_requirement, 1) AS unlock_level,
+                COALESCE(ascc.required_completed_quests, 0) AS req_quests
             FROM abilities a
-            JOIN ability_skill_coin_costs ascc ON a.id = ascc.ability_id
-            WHERE ascc.skill_coin_cost > 0 
-            AND ascc.unlocked_at_level <= %s
+            LEFT JOIN ability_skill_coin_costs ascc ON a.id = ascc.ability_id
+            WHERE COALESCE(ascc.unlocked_at_level, a.level_requirement, 1) <= %s
             AND a.class_id = %s
-            AND a.id NOT IN (SELECT ability_id FROM character_learned_abilities WHERE character_id = %s)
-        """, char_data[0], char_data[1], character_id)
-        
-        return {
-            "abilities": [
+            ORDER BY COALESCE(ascc.unlocked_at_level, a.level_requirement, 1) ASC,
+               COALESCE(ascc.skill_coin_cost, 10) ASC,
+               a.name ASC
+        """, level, class_id)
+
+        result = []
+        role_tags = ("[ATK", "[DEF", "[REC]", "[ULT]")
+        for a in abilities:
+            ability_id, name, desc, ability_class_id, cost, unlock_level, req_quests = a
+            if ability_id in learned_ids:
+                continue
+            # Race-class uniqueness filter.
+            if race_class_prefix:
+                if not (name.startswith(race_class_prefix) or name.startswith(race_prefix)):
+                    continue
+            if not any(tag in name for tag in role_tags):
+                continue
+            affordable = int(cost or 0) <= coin_balance
+            quest_gate_ok = completed_quests >= int(req_quests or 0)
+            result.append(
                 {
-                    "ability_id": a[0],
-                    "name": a[1],
-                    "description": a[2],
-                    "skill_coin_cost": a[3],
-                    "unlocked_at_level": a[4],
-                    "is_affordable": a[3] <= fetch_one("SELECT balance FROM skill_coins WHERE character_id = %s", character_id)[0]
-                } for a in abilities
-            ]
+                    "ability_id": ability_id,
+                    "name": name,
+                    "description": desc,
+                    "skill_coin_cost": int(cost or 0),
+                    "honor_points_cost": int(cost or 0),
+                    "unlocked_at_level": int(unlock_level or 1),
+                    "required_completed_quests": int(req_quests or 0),
+                    "is_affordable": affordable,
+                    "requirements_met": affordable and quest_gate_ok,
+                    "is_race_class_unique": True,
+                }
+            )
+
+        return {
+            "balance": coin_balance,
+            "honor_points": coin_balance,
+            "completed_quests": completed_quests,
+            "abilities": result,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/abilities/{character_id}/honor-shop", response_model=dict)
+async def get_honor_shop(character_id: int, current_user_id: int = Depends(get_current_user_id)):
+    """Alias for purchasable abilities endpoint (UI-friendly naming)."""
+    return await get_purchasable_abilities(character_id, current_user_id)

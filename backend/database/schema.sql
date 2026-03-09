@@ -20,6 +20,12 @@ CREATE TABLE IF NOT EXISTS character_classes (
     description TEXT,
     base_health INTEGER DEFAULT 100,
     base_mana INTEGER DEFAULT 50,
+    base_strength INTEGER DEFAULT 10,
+    base_dexterity INTEGER DEFAULT 10,
+    base_constitution INTEGER DEFAULT 10,
+    base_intelligence INTEGER DEFAULT 10,
+    base_wisdom INTEGER DEFAULT 10,
+    base_luck INTEGER DEFAULT 10,
     health_per_level INTEGER DEFAULT 10,
     mana_per_level INTEGER DEFAULT 5,
     primary_stat VARCHAR(20),             -- strength, intelligence, dexterity
@@ -85,6 +91,7 @@ CREATE TABLE IF NOT EXISTS characters (
     mana_points INTEGER DEFAULT 50,
     max_mana_points INTEGER DEFAULT 50,
     gold INTEGER DEFAULT 0,
+    silver INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_online TIMESTAMP,
     is_online BOOLEAN DEFAULT FALSE
@@ -100,6 +107,7 @@ CREATE TABLE IF NOT EXISTS character_stats (
     intelligence INTEGER DEFAULT 10,       -- Интеллект (магия, крафт)
     wisdom INTEGER DEFAULT 10,             -- Мудрость (рессурсосборка, ремонт)
     luck INTEGER DEFAULT 10,               -- Удача (крит удары, редкие дропы)
+    available_stat_points INTEGER DEFAULT 0,
     stamina INTEGER DEFAULT 100,           -- Текущая выносливость для боя
     max_stamina INTEGER DEFAULT 100,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -190,6 +198,13 @@ CREATE TABLE IF NOT EXISTS combat_log (
     damage_taken INTEGER DEFAULT 0,
     healing_done INTEGER DEFAULT 0,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS mob_aggro_targets (
+    mob_id INTEGER PRIMARY KEY REFERENCES mobs(id) ON DELETE CASCADE,
+    target_character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    aggro_mode VARCHAR(20) NOT NULL DEFAULT 'first_hit',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- ===== ITEMS (предметы для крафта, боя, использования) =====
@@ -420,6 +435,7 @@ CREATE TABLE IF NOT EXISTS ability_skill_coin_costs (
     skill_coin_cost INTEGER DEFAULT 0,    -- 0 = не продается за коины
     class_id INTEGER REFERENCES character_classes(id) ON DELETE CASCADE,
     unlocked_at_level INTEGER DEFAULT 1,  -- На каком уровне доступна для покупки
+    required_completed_quests INTEGER DEFAULT 0, -- Сколько квестов нужно завершить
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

@@ -1,6 +1,6 @@
 # FastAPI и сервер
-fastapi==0.104.1
-uvicorn==0.24.0
+fastapi>=0.115.0
+uvicorn>=0.30.0
 
 # База данных
 psycopg2-binary==2.9.9
@@ -12,7 +12,7 @@ bcrypt==4.0.1
 python-multipart==0.0.6
 
 # Конфигурация
-pydantic==1.10.13
+pydantic>=2.10.0
 python-dotenv==1.0.0
 
 # HTTP клиент для тестов
