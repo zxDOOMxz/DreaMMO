@@ -10,6 +10,7 @@ import json
 import random
 from database.connection import fetch_one, fetch_all, execute, fetch_val
 from passlib.hash import bcrypt
+from mob_population import get_zone_mob_entries, restore_zone_if_fully_dead
 from security import (
     create_access_token,
     ensure_character_owner,
@@ -17,6 +18,34 @@ from security import (
     get_current_user_id,
 )
 from progression import apply_experience_and_level_up
+from oren_daily_quests import ensure_oren_daily_quests_for_npc
+
+
+def _filter_fox_forest_mobs(rows: list[dict]) -> list[dict]:
+    """Keep only canonical fox mobs and collapse duplicates by best alive candidate."""
+    targets = ["старый лис", "молодой лис", "матерый лис", "лисий вожак"]
+
+    def _match_target(name: str) -> str | None:
+        normalized = str(name or "").strip().lower()
+        for t in targets:
+            if t in normalized:
+                return t
+        return None
+
+    best_by_target = {}
+    for row in rows:
+        target_key = _match_target(row.get("name"))
+        if not target_key:
+            continue
+        current = best_by_target.get(target_key)
+        row_alive = int(row.get("alive_count") or 0)
+        cur_alive = int(current.get("alive_count") or 0) if current else -1
+        row_level = int(row.get("level") or 0)
+        cur_level = int(current.get("level") or 0) if current else -1
+        if current is None or row_alive > cur_alive or (row_alive == cur_alive and row_level > cur_level):
+            best_by_target[target_key] = row
+
+    return [best_by_target[t] for t in targets if t in best_by_target]
 
 # ===== Route Definitions =====
 router = APIRouter(prefix="/api", tags=["game"])
@@ -174,6 +203,183 @@ class ChangePasswordModel(BaseModel):
     new_password: str
 
 
+class ChatSendModel(BaseModel):
+    channel: str
+    message: str
+
+
+def _normalize_chat_channel(raw: str) -> str:
+    return str(raw or "").strip().lower()
+
+
+def _resolve_world_chat_label(location_id: int, location_name: str) -> str:
+    # Keep user-facing naming simple for the starter map.
+    if int(location_id or 0) == 1:
+        return "Аурис"
+    return str(location_name or "Мир").strip() or "Мир"
+
+
+def _ensure_chat_table_indexes() -> None:
+    execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_type_created ON chat_messages(chat_type, created_at)")
+    execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_location_type_created ON chat_messages(location_id, chat_type, created_at)")
+
+
+@router.get("/chat/channels/{character_id}", response_model=dict)
+async def get_chat_channels(character_id: int, current_user_id: int = Depends(get_current_user_id)):
+    """Return available chat channels after entering world."""
+    ensure_character_owner(character_id, current_user_id)
+
+    row = fetch_one(
+        """
+        SELECT c.current_location_id, l.name
+        FROM characters c
+        LEFT JOIN locations l ON l.id = c.current_location_id
+        WHERE c.id = %s
+        """,
+        character_id,
+    )
+    location_id = int((row[0] if row and row[0] is not None else 1) or 1)
+    location_name = str(row[1] if row and len(row) > 1 else "")
+    world_label = _resolve_world_chat_label(location_id, location_name)
+
+    return {
+        "channels": [
+            {"id": "world", "label": f"Мир - {world_label}", "location_id": location_id},
+            {"id": "help", "label": "Помощь новичка", "location_id": None},
+            {"id": "trade", "label": "Торговля", "location_id": None},
+            {"id": "system", "label": "Системный", "location_id": None},
+        ]
+    }
+
+
+@router.get("/chat/history/{character_id}", response_model=dict)
+async def get_chat_history(
+    character_id: int,
+    channel: str,
+    limit: int = 50,
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """Load chat history for world/help/trade channels."""
+    ensure_character_owner(character_id, current_user_id)
+    _ensure_chat_table_indexes()
+
+    normalized_channel = _normalize_chat_channel(channel)
+    if normalized_channel not in {"world", "help", "trade"}:
+        raise HTTPException(status_code=400, detail="Unsupported chat channel")
+
+    safe_limit = max(10, min(200, int(limit or 50)))
+
+    if normalized_channel == "world":
+        location_id = fetch_val("SELECT current_location_id FROM characters WHERE id = %s", character_id)
+        location_id = int(location_id or 1)
+        rows = fetch_all(
+            """
+            SELECT cm.id,
+                   cm.sender_id,
+                   COALESCE(ch.name, 'Игрок') AS sender_name,
+                   cm.message,
+                   cm.created_at,
+                   cm.chat_type,
+                   cm.location_id
+            FROM chat_messages cm
+            LEFT JOIN characters ch ON ch.id = cm.sender_id
+            WHERE cm.chat_type = 'world'
+              AND cm.location_id = %s
+            ORDER BY cm.created_at DESC
+            LIMIT %s
+            """,
+            location_id,
+            safe_limit,
+        )
+    else:
+        rows = fetch_all(
+            """
+            SELECT cm.id,
+                   cm.sender_id,
+                   COALESCE(ch.name, 'Игрок') AS sender_name,
+                   cm.message,
+                   cm.created_at,
+                   cm.chat_type,
+                   cm.location_id
+            FROM chat_messages cm
+            LEFT JOIN characters ch ON ch.id = cm.sender_id
+            WHERE cm.chat_type = %s
+            ORDER BY cm.created_at DESC
+            LIMIT %s
+            """,
+            normalized_channel,
+            safe_limit,
+        )
+
+    messages = [
+        {
+            "id": int(r[0]),
+            "sender_id": int(r[1]) if r[1] is not None else None,
+            "sender_name": r[2],
+            "message": r[3],
+            "created_at": r[4].isoformat() if hasattr(r[4], "isoformat") else str(r[4]),
+            "channel": r[5],
+            "location_id": int(r[6]) if r[6] is not None else None,
+        }
+        for r in reversed(rows)
+    ]
+
+    return {"channel": normalized_channel, "messages": messages}
+
+
+@router.post("/chat/send/{character_id}", response_model=dict)
+async def send_chat_message(
+    character_id: int,
+    payload: ChatSendModel,
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """Send chat message to world/help/trade channels."""
+    ensure_character_owner(character_id, current_user_id)
+    _ensure_chat_table_indexes()
+
+    channel = _normalize_chat_channel(payload.channel)
+    if channel not in {"world", "help", "trade"}:
+        raise HTTPException(status_code=400, detail="Unsupported chat channel")
+
+    message = str(payload.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Сообщение пустое")
+    if len(message) > 400:
+        raise HTTPException(status_code=400, detail="Сообщение слишком длинное (макс. 400 символов)")
+
+    location_id = None
+    if channel == "world":
+        location_id = int(fetch_val("SELECT current_location_id FROM characters WHERE id = %s", character_id) or 1)
+
+    message_id = fetch_val(
+        """
+        INSERT INTO chat_messages (sender_id, chat_type, location_id, message)
+        VALUES (%s, %s, %s, %s)
+        RETURNING id
+        """,
+        character_id,
+        channel,
+        location_id,
+        message,
+    )
+
+    sender_name = fetch_val("SELECT name FROM characters WHERE id = %s", character_id) or "Игрок"
+    created_at = fetch_val("SELECT created_at FROM chat_messages WHERE id = %s", message_id)
+
+    return {
+        "status": "sent",
+        "message": {
+            "id": int(message_id),
+            "sender_id": int(character_id),
+            "sender_name": sender_name,
+            "message": message,
+            "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at),
+            "channel": channel,
+            "location_id": location_id,
+        },
+    }
+
+
 @router.post("/auth/register", response_model=dict)
 async def register(user: RegisterModel):
     """Create a new user account"""
@@ -304,8 +510,10 @@ def _resolve_equipment_slot(item_type: str) -> str:
         "axe": "right_hand",
         "mace": "right_hand",
         "one_handed_weapon": "right_hand",
+        "weapon_one_handed": "right_hand",
         "weapon_1h": "right_hand",
         "two_handed_weapon": "right_hand",
+        "weapon_two_handed": "right_hand",
         "weapon_2h": "right_hand",
         "bow": "right_hand",
         "staff": "right_hand",
@@ -530,10 +738,23 @@ async def create_character(data: dict, current_user_id: int = Depends(get_curren
         base_health = char_class[0] + (race[2] * 5)  # constitution bonus affects health
         base_mana = char_class[1] + (race[3] * 3)    # intelligence bonus affects mana
         
-        # Create character with spawn location set to Элдория (location_id = 1)
+        # Create character with spawn location set to Элдория city (location_id = 1)
+        default_city_zone = fetch_one(
+            """
+            SELECT id
+            FROM mob_spawn_zones
+            WHERE location_id = 1
+            ORDER BY
+                CASE WHEN zone_name = 'Город новичков Аурис' THEN 0 ELSE 1 END,
+                CASE WHEN zone_type = 'city' THEN 0 ELSE 1 END,
+                id
+            LIMIT 1
+            """
+        )
+        default_city_zone_id = int(default_city_zone[0]) if default_city_zone else None
         execute(
-            "INSERT INTO characters (user_id, name, race_id, class_id, level, experience, health_points, max_health_points, mana_points, max_mana_points, gold, silver, current_location_id, position_x, position_y) VALUES (%s, %s, %s, %s, 1, 0, %s, %s, %s, %s, 100, 100, 1, 0, 0)",
-            user_id, name, race_id, class_id, base_health, base_health, base_mana, base_mana
+            "INSERT INTO characters (user_id, name, race_id, class_id, level, experience, health_points, max_health_points, mana_points, max_mana_points, gold, silver, current_location_id, current_zone_id, position_x, position_y) VALUES (%s, %s, %s, %s, 1, 0, %s, %s, %s, %s, 100, 100, 1, %s, 0, 0)",
+            user_id, name, race_id, class_id, base_health, base_health, base_mana, base_mana, default_city_zone_id
         )
         
         char_id = fetch_one("SELECT id FROM characters WHERE name = %s", name)[0]
@@ -1007,8 +1228,23 @@ async def list_locations():
     """Get all available locations"""
     try:
         locations = fetch_all(
-            "SELECT id, name, location_type, danger_level, capacity FROM locations ORDER BY name"
+            """
+            SELECT id, name, description, location_type, danger_level, capacity
+            FROM locations
+            WHERE name IN ('Изумрудные леса Лирана', 'Туманные болота Моргрима', 'Пепельные земли Кхаргара')
+            ORDER BY CASE name
+                WHEN 'Изумрудные леса Лирана' THEN 1
+                WHEN 'Туманные болота Моргрима' THEN 2
+                WHEN 'Пепельные земли Кхаргара' THEN 3
+                ELSE 99
+            END
+            """
         )
+
+        if not locations:
+            locations = fetch_all(
+                "SELECT id, name, description, location_type, danger_level, capacity FROM locations ORDER BY id"
+            )
         
         return {
             "count": len(locations),
@@ -1016,9 +1252,10 @@ async def list_locations():
                 {
                     "id": loc[0],
                     "name": loc[1],
-                    "type": loc[2],
-                    "danger_level": loc[3],
-                    "capacity": loc[4]
+                    "description": loc[2],
+                    "type": loc[3],
+                    "danger_level": loc[4],
+                    "capacity": loc[5]
                 }
                 for loc in locations
             ]
@@ -1043,7 +1280,18 @@ async def world_current(character_id: int, current_user_id: int = Depends(get_cu
         )
         
         if not char_location or char_location[0] is None:
-            default_zone = fetch_one("SELECT id FROM mob_spawn_zones WHERE location_id = 1 ORDER BY id LIMIT 1")
+            default_zone = fetch_one(
+                """
+                SELECT id
+                FROM mob_spawn_zones
+                WHERE location_id = 1
+                ORDER BY
+                    CASE WHEN zone_name = 'Город новичков Аурис' THEN 0 ELSE 1 END,
+                    CASE WHEN zone_type = 'city' THEN 0 ELSE 1 END,
+                    id
+                LIMIT 1
+                """
+            )
             default_zone_id = int(default_zone[0]) if default_zone else None
             execute(
                 "UPDATE characters SET current_location_id = 1, current_zone_id = %s, position_x = 0, position_y = 0, position_z = 0 WHERE id = %s",
@@ -1051,11 +1299,11 @@ async def world_current(character_id: int, current_user_id: int = Depends(get_cu
                 character_id,
             )
             location_id = 1
-            zone_id = default_zone_id
+            active_subzone_id = default_zone_id
             pos_x, pos_y, pos_z = 0, 0, 0
         else:
             location_id = char_location[0]
-            zone_id = char_location[1]
+            active_subzone_id = char_location[1]
             pos_x = float(char_location[2] or 0)
             pos_y = float(char_location[3] or 0)
             pos_z = float(char_location[4] or 0)
@@ -1069,6 +1317,10 @@ async def world_current(character_id: int, current_user_id: int = Depends(get_cu
         if not loc:
             raise HTTPException(status_code=404, detail="Location not found")
         
+        active_zone = None
+        if active_subzone_id:
+            active_zone = fetch_one("SELECT zone_name, zone_type FROM mob_spawn_zones WHERE id = %s", active_subzone_id)
+
         return {
             "location": {
                 "id": loc[0],
@@ -1078,9 +1330,15 @@ async def world_current(character_id: int, current_user_id: int = Depends(get_cu
                 "danger_level": loc[4],
             },
             "zone": {
-                "id": zone_id,
-                "name": fetch_val("SELECT zone_name FROM mob_spawn_zones WHERE id = %s", zone_id) if zone_id else None,
-                "type": fetch_val("SELECT zone_type FROM mob_spawn_zones WHERE id = %s", zone_id) if zone_id else None,
+                "id": active_subzone_id,
+                "name": active_zone[0] if active_zone else None,
+                "type": active_zone[1] if active_zone else None,
+            },
+            "area": {
+                "id": active_subzone_id,
+                "name": active_zone[0] if active_zone else None,
+                "type": active_zone[1] if active_zone else None,
+                "kind": "subzone",
             },
             "character_position": {"x": pos_x, "y": pos_y, "z": pos_z},
         }
@@ -1102,7 +1360,18 @@ async def get_mobs_in_location(character_id: int, current_user_id: int = Depends
         )
         if not location_row or not location_row[0]:
             # Default to Элдория
-            default_zone = fetch_one("SELECT id FROM mob_spawn_zones WHERE location_id = 1 ORDER BY id LIMIT 1")
+            default_zone = fetch_one(
+                """
+                SELECT id
+                FROM mob_spawn_zones
+                WHERE location_id = 1
+                ORDER BY
+                    CASE WHEN zone_name = 'Город новичков Аурис' THEN 0 ELSE 1 END,
+                    CASE WHEN zone_type = 'city' THEN 0 ELSE 1 END,
+                    id
+                LIMIT 1
+                """
+            )
             default_zone_id = int(default_zone[0]) if default_zone else None
             execute("UPDATE characters SET current_location_id = 1, current_zone_id = %s, position_z = COALESCE(position_z, 0) WHERE id = %s", default_zone_id, character_id)
             location_id = 1
@@ -1114,39 +1383,17 @@ async def get_mobs_in_location(character_id: int, current_user_id: int = Depends
         # Mobs are shown for the currently entered zone only.
         mobs = []
         if zone_id:
-            mobs = fetch_all(
-                """
-                SELECT m.id, m.name, m.level, m.health_points, m.max_health_points, m.damage_min, m.damage_max,
-                       m.armor_class, m.experience_reward, m.gold_reward, m.mob_type, m.aggression_type
-                FROM mob_zone_spawns mzs
-                JOIN mobs m ON m.id = mzs.mob_id
-                WHERE mzs.spawn_zone_id = %s
-                  AND m.location_id = %s
-                  AND m.health_points > 0
-                ORDER BY m.level ASC, m.name ASC
-                """,
-                zone_id,
-                location_id,
-            )
+            restore_zone_if_fully_dead(int(zone_id))
+            zone_name_row = fetch_one("SELECT zone_name FROM mob_spawn_zones WHERE id = %s", zone_id)
+            zone_name = str(zone_name_row[0] if zone_name_row else "")
+            is_fox_forest = "лисий лес" in zone_name.lower()
+
+            mobs = get_zone_mob_entries(int(zone_id), int(location_id))
+            if is_fox_forest:
+                mobs = _filter_fox_forest_mobs(mobs)
         
         return {
-            "mobs": [
-                {
-                    "id": m[0],
-                    "name": m[1],
-                    "level": m[2],
-                    "health": m[3],
-                    "max_health": m[4],
-                    "damage_min": m[5],
-                    "damage_max": m[6],
-                    "armor": m[7],
-                    "exp_reward": m[8],
-                    "gold_reward": m[9],
-                    "type": m[10],
-                    "aggression": m[11]
-                }
-                for m in mobs
-            ],
+            "mobs": mobs,
             "location_id": location_id,
             "zone_id": zone_id,
         }
@@ -1154,8 +1401,13 @@ async def get_mobs_in_location(character_id: int, current_user_id: int = Depends
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/world/objects", response_model=dict)
+async def get_visible_world_objects(character_id: int, current_user_id: int = Depends(get_current_user_id)):
     """Get all visible objects in the zone (characters within 300m, buildings and NPCs in zone)"""
     try:
+        ensure_character_owner(character_id, current_user_id)
+
         # Get current location
         location_row = fetch_one(
             "SELECT current_location_id FROM player_status WHERE character_id = %s",
@@ -1531,6 +1783,14 @@ async def get_available_quests(location_id: int, character_id: int, current_user
     try:
         ensure_character_owner(character_id, current_user_id)
 
+        oren_npc_ids = fetch_all(
+            "SELECT id FROM npcs WHERE location_id = %s AND LOWER(name) = LOWER(%s)",
+            location_id,
+            "Смотритель Равнин Орен",
+        )
+        for (oren_npc_id,) in oren_npc_ids:
+            ensure_oren_daily_quests_for_npc(int(oren_npc_id))
+
         quests = fetch_all("""
             SELECT  q.id, q.title, q.description, q.quest_type, q.level_requirement, 
                    q.reward_experience, q.reward_gold, n.name as npc_name
@@ -1840,7 +2100,7 @@ async def complete_quest(character_id: int, quest_id: int, current_user_id: int 
 
         # Get quest details
         quest = fetch_one(
-            """SELECT reward_experience, reward_gold, quest_type, level_requirement FROM quests WHERE id = %s""",
+            """SELECT reward_experience, reward_gold, quest_type, level_requirement, reward_item_id, completion_condition FROM quests WHERE id = %s""",
             quest_id
         )
         
@@ -1866,7 +2126,46 @@ async def complete_quest(character_id: int, quest_id: int, current_user_id: int 
             if (pending or 0) > 0:
                 raise HTTPException(status_code=400, detail="Quest objectives are not completed")
 
+        if quest[2] == 'collect':
+            required_item_id = None
+            required_count = 0
+            try:
+                cond = json.loads(quest[5]) if quest[5] else {}
+                required_item_id = int(cond.get('required_item_id') or 0)
+                required_count = int(cond.get('required_count') or 0)
+            except Exception:
+                required_item_id = None
+                required_count = 0
+
+            if required_item_id and required_count > 0:
+                progress_row = fetch_one(
+                    "SELECT progress_data FROM character_quests WHERE character_id = %s AND quest_id = %s",
+                    character_id,
+                    quest_id,
+                )
+                progress = {}
+                try:
+                    progress = json.loads(progress_row[0]) if progress_row and progress_row[0] else {}
+                except Exception:
+                    progress = {}
+                collected = int(((progress.get('collected_items') or {}).get(str(required_item_id)) or 0))
+                if collected < required_count:
+                    raise HTTPException(status_code=400, detail="Quest objectives are not completed")
+
+                # Spend collected resources on turn-in.
+                _inventory_remove(character_id, required_item_id, required_count)
+
         progression = apply_experience_and_level_up(character_id, int(quest[0] or 0), int(quest[1] or 0))
+
+        reward_item_quantity = 1
+        try:
+            cond = json.loads(quest[5]) if quest[5] else {}
+            reward_item_quantity = max(1, int(cond.get('reward_item_quantity') or 1))
+        except Exception:
+            reward_item_quantity = 1
+
+        if quest[4]:
+            _inventory_add(character_id, int(quest[4]), reward_item_quantity)
         
         # Add honor coins reward (1-5) based on quest complexity.
         coin_reward = _honor_reward_for_quest(int(quest[3] or 1), quest[2])
@@ -1907,6 +2206,8 @@ async def complete_quest(character_id: int, quest_id: int, current_user_id: int 
             "status": "quest_completed",
             "experience_reward": quest[0],
             "gold_reward": quest[1],
+            "reward_item_id": int(quest[4]) if quest[4] else None,
+            "reward_item_quantity": reward_item_quantity if quest[4] else 0,
             "skill_coins_reward": coin_reward,
             "honor_points_reward": coin_reward,
             "new_level": progression["level"],

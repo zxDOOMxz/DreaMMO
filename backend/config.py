@@ -33,7 +33,7 @@ class Settings:
     DEBUG: bool = os.getenv("DEBUG", "True").lower() in ("true", "1", "yes")
     
     # === APP ===
-    APP_NAME: str = "Codex Online API"
+    APP_NAME: str = "CodeX of Honor API"
     APP_VERSION: str = "0.1.0"
     
     # === CORS (для frontend) ===

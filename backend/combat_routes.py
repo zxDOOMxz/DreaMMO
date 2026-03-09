@@ -10,6 +10,7 @@ import random
 import math
 from security import ensure_character_owner, get_current_user_id
 from progression import apply_experience_and_level_up
+from mob_population import consume_mob_unit, fetch_zone_population_row, restore_zone_if_fully_dead
 
 combat_router = APIRouter()
 
@@ -108,6 +109,91 @@ def get_exp_multiplier(character_level, mob_level):
     
     # Default: full XP if mob is same level or higher
     return 1.0, 1.0
+
+
+def _is_humanoid_mob(mob_type: str) -> bool:
+    normalized = (mob_type or "").strip().lower()
+    humanoid_markers = (
+        "human",
+        "humanoid",
+        "orc",
+        "elf",
+        "dwarf",
+        "bandit",
+        "goblin",
+        "knight",
+        "солдат",
+        "бандит",
+        "гуманоид",
+    )
+    return any(marker in normalized for marker in humanoid_markers)
+
+
+def _resolve_death_territory(character_id: int) -> str:
+    row = fetch_one(
+        """
+        SELECT c.current_location_id,
+               COALESCE(l.is_pvp_enabled, FALSE),
+               COALESCE(l.danger_level, 0),
+               COALESCE(z.zone_type, '')
+        FROM characters c
+        LEFT JOIN locations l ON l.id = c.current_location_id
+        LEFT JOIN mob_spawn_zones z ON z.id = c.current_zone_id
+        WHERE c.id = %s
+        """,
+        character_id,
+    )
+    if not row:
+        return "starter"
+
+    location_id, is_pvp_enabled, danger_level, zone_type = row
+    zone_type = (zone_type or "").strip().lower()
+
+    if int(location_id or 0) == 1 or zone_type == "city" or (not is_pvp_enabled and int(danger_level or 0) <= 2):
+        return "starter"
+    if bool(is_pvp_enabled):
+        return "pvp"
+    return "neutral"
+
+
+def _drop_inventory_on_death(character_id: int, territory: str) -> list[dict]:
+    if territory == "starter":
+        return []
+
+    rows = fetch_all(
+        """
+        SELECT inv.id, inv.item_id, inv.quantity, i.name
+        FROM inventory inv
+        JOIN items i ON i.id = inv.item_id
+        WHERE inv.character_id = %s
+          AND COALESCE(inv.equipped, FALSE) = FALSE
+          AND COALESCE(inv.quantity, 0) > 0
+        ORDER BY inv.created_at ASC
+        """,
+        character_id,
+    )
+    if not rows:
+        return []
+
+    if territory == "pvp":
+        selected = rows
+    else:
+        max_drop = min(2, len(rows))
+        drop_count = random.randint(1, max_drop)
+        selected = random.sample(rows, k=drop_count)
+
+    dropped_items = []
+    for inv_id, item_id, qty, item_name in selected:
+        execute("DELETE FROM inventory WHERE id = %s", inv_id)
+        dropped_items.append(
+            {
+                "item_id": int(item_id),
+                "name": item_name,
+                "quantity": int(qty or 0),
+            }
+        )
+
+    return dropped_items
 
 
 def _load_combat_stats_row(character_id: int):
@@ -247,7 +333,7 @@ async def attack_mob(character_id: int, mob_id: int, ability_id: int = None, cur
 
         # Get character stats
         char = fetch_one("""
-             SELECT c.id, c.name, c.level, c.health_points, c.max_health_points, c.position_x, c.position_y,
+            SELECT c.id, c.name, c.level, c.health_points, c.max_health_points, c.position_x, c.position_y, c.experience,
                  s.strength, s.dexterity, s.constitution, s.intelligence, s.wisdom, s.luck,
                  COALESCE(cc.name, '')
             FROM characters c
@@ -259,7 +345,7 @@ async def attack_mob(character_id: int, mob_id: int, ability_id: int = None, cur
         if not char:
             raise HTTPException(status_code=404, detail="Character not found")
         
-        char_id, char_name, char_lvl, char_hp, char_max_hp, char_x, char_y, str_val, dex, con, int_val, wis, luck, class_name = char
+        char_id, char_name, char_lvl, char_hp, char_max_hp, char_x, char_y, char_exp, str_val, dex, con, int_val, wis, luck, class_name = char
 
         equipped_bonus = fetch_one(
             """
@@ -277,20 +363,69 @@ async def attack_mob(character_id: int, mob_id: int, ability_id: int = None, cur
         
         # Get mob stats
         mob = fetch_one("""
-            SELECT id, name, level, health_points, max_health_points, damage_min, damage_max, 
-                   armor_class, experience_reward, gold_reward, position_x, position_y, is_champion, champion_stars
+                 SELECT id, name, level, health_points, max_health_points, damage_min, damage_max,
+                     armor_class, experience_reward, gold_reward, position_x, position_y, is_champion, champion_stars, mob_type
             FROM mobs WHERE id = %s
         """, mob_id)
         
         if not mob:
             raise HTTPException(status_code=404, detail="Mob not found")
         
-        mob_id, mob_name, mob_lvl, mob_hp, mob_max_hp, mob_dmg_min, mob_dmg_max, mob_armor, mob_exp, mob_gold, mob_x, mob_y, is_champ, champ_stars = mob
+        mob_id, mob_name, mob_lvl, mob_hp, mob_max_hp, mob_dmg_min, mob_dmg_max, mob_armor, mob_exp, mob_gold, mob_x, mob_y, is_champ, champ_stars, mob_type = mob
+        is_humanoid = _is_humanoid_mob(mob_type)
+
+        in_current_zone = fetch_val(
+            """
+            SELECT 1
+            FROM characters c
+            JOIN mob_zone_spawns mzs ON mzs.spawn_zone_id = c.current_zone_id
+            WHERE c.id = %s
+              AND mzs.mob_id = %s
+            LIMIT 1
+            """,
+            character_id,
+            mob_id,
+        )
+        if not in_current_zone:
+            raise HTTPException(status_code=400, detail="Этот моб не находится в текущей зоне")
+
+        active_zone_id = fetch_val("SELECT current_zone_id FROM characters WHERE id = %s", character_id)
+        if active_zone_id:
+            restore_zone_if_fully_dead(int(active_zone_id))
+        population_row = fetch_zone_population_row(int(active_zone_id or 0), int(mob_id)) if active_zone_id else None
+        if population_row and int(population_row.get("alive_count", 0)) <= 0:
+            raise HTTPException(status_code=400, detail="Этот тип мобов сейчас полностью истреблен")
+
+        if int(mob_hp or 0) <= 0:
+            if population_row and int(population_row.get("alive_count", 0)) > 0:
+                mob_hp = int(mob_max_hp or 1)
+                execute("UPDATE mobs SET health_points = max_health_points WHERE id = %s", mob_id)
+            else:
+                raise HTTPException(status_code=400, detail="Этот моб сейчас недоступен")
+
+        if population_row and population_row.get("is_boss"):
+            party_size = fetch_val(
+                """
+                SELECT COUNT(*)
+                FROM party_members pm2
+                WHERE pm2.party_id = (
+                    SELECT pm.party_id
+                    FROM party_members pm
+                    JOIN parties p ON p.id = pm.party_id
+                    WHERE pm.character_id = %s
+                      AND COALESCE(pm.status, 'active') = 'active'
+                      AND COALESCE(p.status, 'active') = 'active'
+                    LIMIT 1
+                )
+                  AND COALESCE(pm2.status, 'active') = 'active'
+                """,
+                character_id,
+            ) or 0
+            if int(party_size) < 2:
+                raise HTTPException(status_code=400, detail="Босса можно атаковать только в группе")
         
-        # Check distance (must be within 10 meters)
+        # Distance is still logged for telemetry, but we do not block combat by range in zones.
         distance = math.sqrt((mob_x - char_x)**2 + (mob_y - char_y)**2)
-        if distance > 10:
-            raise HTTPException(status_code=400, detail=f"Слишком далеко! Расстояние: {round(distance, 1)}м. Подойдите ближе.")
         
         # Champion bonuses
         if is_champ:
@@ -399,17 +534,47 @@ async def attack_mob(character_id: int, mob_id: int, ability_id: int = None, cur
         # Calculate XP and gold with Lineage 2 penalties
         exp_gained = 0
         gold_gained = 0
+        silver_gained = 0
         loot_items = []
+        can_butcher = False
+
+        exp_lost = 0
+        death_territory = None
+        dropped_items = []
+
+        if target_character_died and target_character_id == char_id:
+            exp_lost = max(1, int(int(char_exp or 0) * 0.08)) if int(char_exp or 0) > 0 else 0
+            new_exp = max(0, int(char_exp or 0) - exp_lost)
+            death_territory = _resolve_death_territory(character_id)
+            dropped_items = _drop_inventory_on_death(character_id, death_territory)
+            revive_hp = max(1, int(int(char_max_hp or 1) * 0.5))
+            execute(
+                "UPDATE characters SET experience = %s, health_points = %s WHERE id = %s",
+                new_exp,
+                revive_hp,
+                character_id,
+            )
+            attacker_new_hp = revive_hp
         
         if mob_killed:
             exp_mult, gold_mult = get_exp_multiplier(char_lvl, mob_lvl)
             exp_gained = int(mob_exp * exp_mult)
-            gold_gained = int(mob_gold * gold_mult)
+            if is_humanoid:
+                gold_gained = int(mob_gold * gold_mult)
+                silver_gained = max(0, int((mob_gold * gold_mult * 12) // 1))
+            else:
+                gold_gained = 0
+                silver_gained = 0
+                can_butcher = True
 
             progression = apply_experience_and_level_up(character_id, exp_gained, gold_gained)
+            if silver_gained > 0:
+                execute("UPDATE characters SET silver = COALESCE(silver, 0) + %s WHERE id = %s", silver_gained, character_id)
             execute("UPDATE characters SET health_points = %s WHERE id = %s", attacker_new_hp, character_id)
             
-            # Respawn mob or mark as dead
+            # Consume one unit from zone population and keep legacy mob hp state for compatibility.
+            if active_zone_id:
+                consume_mob_unit(int(active_zone_id), int(mob_id))
             execute("UPDATE mobs SET health_points = 0 WHERE id = %s", mob_id)
             execute("DELETE FROM mob_aggro_targets WHERE mob_id = %s", mob_id)
 
@@ -453,7 +618,10 @@ async def attack_mob(character_id: int, mob_id: int, ability_id: int = None, cur
             level_note = ""
             if progression.get("leveled_up"):
                 level_note = f" | Уровень повышен до {progression.get('level')}"
-            mob_message = f"☠️ {mob_name} повержен! +{exp_gained} опыта, +{gold_gained} золота{level_note}"
+            reward_note = f"+{exp_gained} опыта"
+            if is_humanoid:
+                reward_note += f", +{gold_gained} золота, +{silver_gained} серебра"
+            mob_message = f"☠️ {mob_name} повержен! {reward_note}{level_note}"
         else:
             # Update mob HP
             execute("UPDATE mobs SET health_points = %s WHERE id = %s", new_mob_hp, mob_id)
@@ -477,7 +645,13 @@ async def attack_mob(character_id: int, mob_id: int, ability_id: int = None, cur
             "character_died": target_character_died if target_character_id == char_id else False,
             "exp_gained": exp_gained,
             "gold_gained": gold_gained,
+            "silver_gained": silver_gained,
             "loot": loot_items,
+            "can_butcher": can_butcher,
+            "mob_type": mob_type,
+            "exp_lost": exp_lost,
+            "death_territory": death_territory,
+            "dropped_items": dropped_items,
             "character_hp": attacker_new_hp,
             "character_max_hp": char_max_hp,
             "mob_target_character_id": target_character_id,

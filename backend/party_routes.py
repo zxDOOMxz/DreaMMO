@@ -3,6 +3,7 @@ Party system routes for group gameplay
 """
 
 from datetime import datetime
+from threading import RLock
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -11,8 +12,19 @@ from security import ensure_character_owner, get_current_user_id
 
 party_router = APIRouter()
 
+_party_schema_ready = False
+_party_schema_lock = RLock()
+
 
 def _ensure_party_schema() -> None:
+    global _party_schema_ready
+    if _party_schema_ready:
+        return
+
+    with _party_schema_lock:
+        if _party_schema_ready:
+            return
+
     execute(
         """
         CREATE TABLE IF NOT EXISTS parties (
@@ -39,6 +51,19 @@ def _ensure_party_schema() -> None:
         )
         """
     )
+    execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_party_invited_pending_expires
+        ON party_invitations (invited_character_id, status, expires_at)
+        """
+    )
+    execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_characters_current_location
+        ON characters (current_location_id)
+        """
+    )
+    _party_schema_ready = True
     execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS party_id INTEGER REFERENCES parties(id)")
     execute(
         """

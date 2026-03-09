@@ -61,6 +61,8 @@ function App() {
 
   const [world, setWorld] = useState(null);
   const [worldLoading, setWorldLoading] = useState(false);
+  const [worldMaps, setWorldMaps] = useState([]);
+  const [selectedWorldMapId, setSelectedWorldMapId] = useState(null);
 
   // World Interface
   const [inWorld, setInWorld] = useState(false);
@@ -80,6 +82,7 @@ function App() {
   const [mobs, setMobs] = useState([]);
   const [currentCombat, setCurrentCombat] = useState(null);
   const [combatLog, setCombatLog] = useState([]);
+  const [selectedMobId, setSelectedMobId] = useState(null);
 
   // Quests & Crafting
   const [availableQuests, setAvailableQuests] = useState([]);
@@ -94,13 +97,21 @@ function App() {
   const [showButcherPanel, setShowButcherPanel] = useState(false);
 
   // Positioning & Movement
-  const [zones, setZones] = useState([]);
+  const [subzones, setSubzones] = useState([]);
+  const [nearestCityDistanceM, setNearestCityDistanceM] = useState(null);
   const [npcsInLocation, setNpcsInLocation] = useState([]);
   const [movement, setMovement] = useState({ is_moving: false, distance_remaining: 0, target_name: '', eta_seconds: 0 });
   const movementIntervalRef = useRef(null);
+  const autoCombatTimerRef = useRef(null);
+  const autoCombatEnabledRef = useRef(false);
+  const currentCombatRef = useRef(null);
+  const combatAttackInFlightRef = useRef(false);
+  const nearbyPlayersRequestRef = useRef(false);
+  const pendingInvitesRequestRef = useRef(false);
   
   // Combat & Party
   const [combatStats, setCombatStats] = useState(null);
+  const [autoCombatEnabled, setAutoCombatEnabled] = useState(false);
   const [statAllocation, setStatAllocation] = useState(EMPTY_STAT_ALLOCATION);
   const [allocatingStats, setAllocatingStats] = useState(false);
   const [partyInfo, setPartyInfo] = useState(null);
@@ -130,9 +141,17 @@ function App() {
   const generatedIcons = useIconIndex();
 
   // UI State
-  const [activeTab, setActiveTab] = useState('zones'); // zones, inventory, character, abilities, quests, party
-  const [zonesSubTab, setZonesSubTab] = useState('location'); // location, zones, npcs
+  const [activeTab, setActiveTab] = useState('world'); // world, inventory, character, abilities, quests, party, chat
+  const [worldSubTab, setWorldSubTab] = useState('worldmap'); // worldmap, city, hunting, resource
+  const [cityTab, setCityTab] = useState('npcs'); // npcs, stations
+  const [cityInteractionsActive, setCityInteractionsActive] = useState(false);
   const [showTutorial, setShowTutorial] = useState(false);
+  const [chatChannels, setChatChannels] = useState([]);
+  const [chatSubTab, setChatSubTab] = useState('world');
+  const [chatMessagesByChannel, setChatMessagesByChannel] = useState({ world: [], help: [], trade: [] });
+  const [chatInput, setChatInput] = useState('');
+  const [chatLoading, setChatLoading] = useState(false);
+  const [systemChatMessages, setSystemChatMessages] = useState([]);
   const [tutorialProgress, setTutorialProgress] = useState({
     openedQuestsTab: false,
     acceptedQuest: false,
@@ -154,6 +173,50 @@ function App() {
     () => characterClasses.find((cls) => cls.id === selectedClassId) || null,
     [characterClasses, selectedClassId]
   );
+
+  const selectedWorldMap = useMemo(
+    () => worldMaps.find((loc) => loc.id === selectedWorldMapId) || null,
+    [worldMaps, selectedWorldMapId]
+  );
+
+  const worldMapCards = useMemo(() => {
+    const spec = [
+      {
+        name: 'Аурис',
+        apiName: 'Изумрудные леса Лирана',
+        levelRange: '1-10',
+        status: 'Доступно',
+        inDevelopment: false,
+        typeLabel: 'Для новичков',
+      },
+      {
+        name: 'Туманные болота Моргрима',
+        levelRange: '10-15',
+        status: 'В разработке',
+        inDevelopment: true,
+        typeLabel: 'Нейтральная территория',
+      },
+      {
+        name: 'Пепельные земли Кхаргара',
+        levelRange: '15-20',
+        status: 'В разработке',
+        inDevelopment: true,
+        typeLabel: 'ПВП территория',
+      },
+    ];
+
+    return spec.map((entry) => {
+      const apiMap = worldMaps.find((loc) => {
+        const apiName = String(loc?.name || '').trim();
+        return apiName === entry.name || apiName === entry.apiName;
+      }) || null;
+      return {
+        ...entry,
+        id: apiMap?.id ?? null,
+        api: apiMap,
+      };
+    });
+  }, [worldMaps]);
 
   const pendingInvitesCount = pendingInvitations.length;
   const activeQuestIdSet = useMemo(() => new Set((activeQuests || []).map((q) => q.quest_id)), [activeQuests]);
@@ -197,9 +260,9 @@ function App() {
     if (!inWorld || !selectedCharId) return;
     
     const interval = setInterval(() => {
-      loadPendingInvitations();
-      loadNearbyPlayers();
-    }, 5000); // Check every 5 seconds
+      loadPendingInvitations(selectedCharId);
+      loadNearbyPlayers(selectedCharId);
+    }, 10000); // Check every 10 seconds
     
     return () => clearInterval(interval);
   }, [inWorld, selectedCharId]);
@@ -224,13 +287,62 @@ function App() {
   }, [inWorld, selectedCharId, activeTab]);
 
   useEffect(() => {
+    if (!inWorld || !selectedCharId || activeTab !== 'world' || worldSubTab !== 'hunting') return;
+
+    const activeZoneId = Number(world?.zone?.id || 0);
+    const hasActiveHuntingZone = subzones.some(
+      (zone) => String(zone?.type || '').toLowerCase() === 'hunting' && Number(zone.zone_id) === activeZoneId
+    );
+    if (!hasActiveHuntingZone) return;
+
+    const interval = setInterval(() => {
+      loadMobs(selectedCharId);
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [inWorld, selectedCharId, activeTab, worldSubTab, world, subzones]);
+
+  useEffect(() => {
+    if (!inWorld || !selectedCharId) return;
+    loadChatChannels(selectedCharId);
+    loadChatHistory('world', selectedCharId);
+  }, [inWorld, selectedCharId, world?.location?.id]);
+
+  useEffect(() => {
+    if (!inWorld || !selectedCharId || activeTab !== 'chat' || chatSubTab === 'system') return;
+    const timer = setInterval(() => {
+      loadChatHistory(chatSubTab, selectedCharId);
+    }, 6000);
+    return () => clearInterval(timer);
+  }, [inWorld, selectedCharId, activeTab, chatSubTab]);
+
+  useEffect(() => {
     return () => {
       if (movementIntervalRef.current) {
         clearInterval(movementIntervalRef.current);
         movementIntervalRef.current = null;
       }
+      if (autoCombatTimerRef.current) {
+        clearTimeout(autoCombatTimerRef.current);
+        autoCombatTimerRef.current = null;
+      }
     };
   }, []);
+
+  useEffect(() => {
+    autoCombatEnabledRef.current = autoCombatEnabled;
+  }, [autoCombatEnabled]);
+
+  useEffect(() => {
+    currentCombatRef.current = currentCombat;
+  }, [currentCombat]);
+
+  useEffect(() => {
+    if (!currentCombat || !['ready', 'active'].includes(currentCombat.status)) {
+      setAutoCombatEnabled(false);
+      clearAutoCombatTimer();
+    }
+  }, [currentCombat]);
 
   // Server health
   const checkHealth = async () => {
@@ -414,6 +526,77 @@ function App() {
     }
   };
 
+  const loadWorldMaps = async () => {
+    try {
+      const { data } = await api.get('/locations');
+      setWorldMaps(data?.locations || []);
+    } catch (e) {
+      console.warn('world maps load failed:', e);
+      setWorldMaps([]);
+    }
+  };
+
+  const appendSystemMessage = (text) => {
+    const msg = {
+      id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      text,
+      created_at: new Date().toISOString(),
+    };
+    setSystemChatMessages((prev) => [...prev.slice(-79), msg]);
+  };
+
+  const loadChatChannels = async (charId = selectedCharId) => {
+    if (!charId) return;
+    try {
+      const { data } = await api.get(`/chat/channels/${charId}`);
+      const channels = data?.channels || [];
+      setChatChannels(channels);
+    } catch (err) {
+      console.warn('chat channels load failed:', err);
+      setChatChannels([]);
+    }
+  };
+
+  const loadChatHistory = async (channel, charId = selectedCharId) => {
+    if (!charId || !channel || channel === 'system') return;
+    setChatLoading(true);
+    try {
+      const { data } = await api.get(`/chat/history/${charId}`, {
+        params: { channel, limit: 80 }
+      });
+      const messages = data?.messages || [];
+      setChatMessagesByChannel((prev) => ({ ...prev, [channel]: messages }));
+    } catch (err) {
+      console.warn('chat history load failed:', err);
+      setChatMessagesByChannel((prev) => ({ ...prev, [channel]: [] }));
+    } finally {
+      setChatLoading(false);
+    }
+  };
+
+  const sendChatMessage = async () => {
+    if (!selectedCharId || chatSubTab === 'system') return;
+    const text = String(chatInput || '').trim();
+    if (!text) return;
+    try {
+      const { data } = await api.post(`/chat/send/${selectedCharId}`, {
+        channel: chatSubTab,
+        message: text,
+      });
+      const sent = data?.message;
+      if (sent) {
+        setChatMessagesByChannel((prev) => {
+          const current = Array.isArray(prev[chatSubTab]) ? prev[chatSubTab] : [];
+          return { ...prev, [chatSubTab]: [...current.slice(-79), sent] };
+        });
+      }
+      setChatInput('');
+      setError(null);
+    } catch (err) {
+      setError(err?.response?.data?.detail || 'Ошибка отправки сообщения');
+    }
+  };
+
   const loadZoneObjects = async (charId) => {
     try {
       const { data } = await api.get('/world/objects', { params: { character_id: charId } });
@@ -594,7 +777,17 @@ function App() {
     try {
       const { data } = await api.post(`/butchering/butcher_mob`, null, { params: { character_id: selectedCharId, mob_id: mobId } });
       setError(null);
-      setCombatLog([...combatLog, `✅ ${data.obtained_items.map(i => `${i.name}x${i.quantity}`).join(', ')}`]);
+      const itemsText = (data.obtained_items || []).map((i) => `${i.name}x${i.quantity}`).join(', ');
+      setCombatLog((prev) => [`✅ Разделка: ${itemsText || 'нет ресурсов'}`, ...prev].slice(0, 50));
+      setCurrentCombat((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          butchered: true,
+          butchered_items: data.obtained_items || [],
+        };
+      });
+      await loadInventory(selectedCharId);
       await loadButcheringSkill(selectedCharId);
     } catch (e) {
       setError(`Ошибка разделки: ${e?.response?.data?.detail || e.message}`);
@@ -610,6 +803,7 @@ function App() {
       await loadSkillCoins(selectedCharId);
       await loadPurchasableAbilities(selectedCharId);
       setCombatLog([...combatLog, `🎉 Квест завершен! +${data.honor_points_reward || data.skill_coins_reward} очков чести`]);
+      appendSystemMessage(`Квест завершен: +${data.reward_experience || 0} опыта, +${data.reward_gold || 0} золота, +${data.honor_points_reward || data.skill_coins_reward || 0} очков чести`);
       setTutorialProgress((prev) => ({ ...prev, completedQuest: true }));
     } catch (e) {
       setError(`Ошибка завершения квеста: ${e?.response?.data?.detail || e.message}`);
@@ -623,79 +817,57 @@ function App() {
     setShowTutorial(false);
   };
 
-  const startCombat = async (mobId) => {
-    if (!selectedCharId) return;
-    try {
-      // For now, simulate combat start
-      const mob = mobs.find(m => m.id === mobId);
-      if (mob) {
-        setCurrentCombat({
-          mob: mob,
-          character_health: selectedCharacter?.health_points || 100,
-          mob_health: mob.health,
-          turn: 'character',
-          status: 'active'
-        });
-        setCombatLog([`Бой начат с ${mob.name}!`]);
+  const selectMobForCombat = (mob) => {
+    const isBoss = String(mob?.mob_tier || '').toLowerCase() === 'boss' || Boolean(mob?.is_boss);
+    const inParty = Boolean(partyInfo?.in_party || partyInfo?.party_id);
+    if (isBoss && !inParty) {
+      const confirmed = window.confirm('Вы уверены что хотите начать атаку?');
+      if (!confirmed) {
+        return;
       }
-    } catch (e) {
-      setError(`Ошибка начала боя: ${e?.response?.data?.detail || e.message}`);
     }
+
+    stopAutoCombat();
+    const mobDisplayName = isBoss ? `${mob.name} (Босс)` : mob.name;
+    setSelectedMobId(mob.id);
+    setCurrentCombat({
+      mob_id: mob.id,
+      mob_name: mobDisplayName,
+      mob_health: mob.health,
+      mob_max_health: mob.max_health,
+      character_health: selectedCharacter?.health_points || 1,
+      character_max_health: selectedCharacter?.max_health_points || 1,
+      status: 'ready',
+      exp_gained: 0,
+      gold_gained: 0,
+      silver_gained: 0,
+      exp_lost: 0,
+      death_territory: null,
+      dropped_items: [],
+      can_butcher: false,
+      butchered: false,
+      butchered_items: [],
+      mob_tier: mob?.mob_tier || null,
+    });
+    setCombatLog([`Выбран противник: ${mobDisplayName}`]);
+  };
+
+  const finishCombat = () => {
+    stopAutoCombat();
+    setCurrentCombat(null);
+    setSelectedMobId(null);
+    setCombatLog([]);
+  };
+
+  const leaveCombat = () => {
+    stopAutoCombat();
+    setCombatLog((prev) => ['Вы отступили из боя.', ...prev].slice(0, 50));
+    setCurrentCombat((prev) => (prev ? { ...prev, status: 'fled' } : prev));
   };
 
   const useAbility = async (abilityId) => {
-    if (!currentCombat || !selectedCharId) return;
-    
-    try {
-      const ability = characterAbilities.find(a => a.id === abilityId);
-      if (!ability) return;
-      
-      // Simulate ability use
-      let damage = 0;
-      let healing = 0;
-      let newMobHealth = currentCombat.mob_health;
-      let newCharHealth = currentCombat.character_health;
-      
-      if (ability.effect_type === 'damage') {
-        damage = Math.floor(Math.random() * (ability.damage_max - ability.damage_min + 1)) + ability.damage_min;
-        newMobHealth = Math.max(0, currentCombat.mob_health - damage);
-      } else if (ability.effect_type === 'heal') {
-        healing = ability.healing;
-        newCharHealth = Math.min(selectedCharacter?.max_health_points || 100, currentCombat.character_health + healing);
-      }
-      
-      const newLog = [...combatLog];
-      newLog.push(`${selectedCharacter?.name} использует ${ability.name}${damage > 0 ? ` и наносит ${damage} урона!` : healing > 0 ? ` и восстанавливает ${healing} здоровья!` : '!'}`);
-      
-      if (newMobHealth <= 0) {
-        newLog.push(`${currentCombat.mob.name} побежден!`);
-        setCurrentCombat(null);
-        // Award experience
-        newLog.push(`Получено ${currentCombat.mob.exp_reward} опыта и ${currentCombat.mob.gold_reward} золота!`);
-      } else {
-        // Mob counterattack
-        const mobDamage = Math.floor(Math.random() * (currentCombat.mob.damage_max - currentCombat.mob.damage_min + 1)) + currentCombat.mob.damage_min;
-        newCharHealth = Math.max(0, newCharHealth - mobDamage);
-        newLog.push(`${currentCombat.mob.name} атакует и наносит ${mobDamage} урона!`);
-        
-        if (newCharHealth <= 0) {
-          newLog.push(`${selectedCharacter?.name} побежден!`);
-          setCurrentCombat(null);
-        }
-      }
-      
-      setCombatLog(newLog);
-      if (currentCombat) {
-        setCurrentCombat({
-          ...currentCombat,
-          mob_health: newMobHealth,
-          character_health: newCharHealth
-        });
-      }
-      
-    } catch (e) {
-      setError(`Ошибка использования умения: ${e?.response?.data?.detail || e.message}`);
-    }
+    if (!currentCombat?.mob_id) return;
+    await attackMob(currentCombat.mob_id, abilityId);
   };
 
   const handleEnterWorld = async (charId = selectedCharId) => {
@@ -707,24 +879,31 @@ function App() {
       const { data: worldData } = await api.get('/world/current', { params: { character_id: charId } });
       const locationId = worldData?.location?.id || 1;
       setWorld(worldData);
+      setSelectedWorldMapId(locationId);
       setAvailableQuests([]);
       setQuestSourceNpcName('');
       setShowQuestPanel(false);
       
-      // Load all data
-      await loadLocationZones(locationId, charId);
-      await loadCharacterAbilities(charId);
-      await loadCombatStats(charId);
-      await loadPartyInfo(charId);
-      await loadNearbyPlayers(charId);
-      await loadPendingInvitations(charId);
-      await loadActiveQuests(charId);
-      await loadSkillCoins(charId);
-      await loadPurchasableAbilities(charId);
-      await loadButcheringSkill(charId);
-      await api.post(`/characters/${charId}/starter-items/ensure`);
-      await loadInventory(charId);
-      await loadMobs(charId);
+      // Fast world entry: render location/UI first, then load heavy data in background.
+      await Promise.all([loadLocationSubzones(locationId, charId), loadWorldMaps()]);
+
+      await Promise.all([loadChatChannels(charId), loadChatHistory('world', charId), loadChatHistory('help', charId), loadChatHistory('trade', charId)]);
+
+      Promise.allSettled([
+        loadCharacterAbilities(charId),
+        loadCombatStats(charId),
+        loadPartyInfo(charId),
+        loadNearbyPlayers(charId),
+        loadPendingInvitations(charId),
+        loadActiveQuests(charId),
+        loadSkillCoins(charId),
+        loadPurchasableAbilities(charId),
+        loadButcheringSkill(charId),
+        api.post(`/characters/${charId}/starter-items/ensure`),
+        loadInventory(charId),
+        loadMobs(charId),
+      ]);
+      appendSystemMessage(`Вход в мир: ${worldData?.location?.name || 'Неизвестная локация'}`);
     } catch (err) {
       setError('Ошибка входа в мир: ' + (err.response?.data?.detail || err.message));
     }
@@ -736,7 +915,8 @@ function App() {
       movementIntervalRef.current = null;
     }
     setInWorld(false);
-    setZones([]);
+    setSubzones([]);
+    setNearestCityDistanceM(null);
     setNpcsInLocation([]);
     setAvailableQuests([]);
     setQuestSourceNpcName('');
@@ -759,21 +939,47 @@ function App() {
     setShopNpcName('');
     setShowCraftModal(false);
     setCraftRecipes([]);
-    setZonesSubTab('location');
+    setCurrentCombat(null);
+    stopAutoCombat();
+    setCombatLog([]);
+    setSelectedMobId(null);
+    setWorldSubTab('worldmap');
+    setCityTab('npcs');
+    setCityInteractionsActive(false);
+    setChatChannels([]);
+    setChatSubTab('world');
+    setChatMessagesByChannel({ world: [], help: [], trade: [] });
+    setChatInput('');
+    setSystemChatMessages([]);
   };
 
   // ===== POSITIONING FUNCTIONS =====
 
-  const loadLocationZones = async (locationId, charId = selectedCharId) => {
+  const loadLocationSubzones = async (locationId, charId = selectedCharId) => {
     if (!charId || !locationId) return;
     try {
-      const { data } = await api.get(`/world/zones/${locationId}?character_id=${charId}`);
-      setZones(data.zones || []);
+      let data;
+      try {
+        ({ data } = await api.get(`/world/subzones/${locationId}?character_id=${charId}&include_mobs=false`));
+      } catch (primaryErr) {
+        if (primaryErr?.response?.status !== 404) {
+          throw primaryErr;
+        }
+        ({ data } = await api.get(`/world/zones/${locationId}?character_id=${charId}&include_mobs=false`));
+      }
+      setSubzones(data.subzones || data.zones || []);
+      setNearestCityDistanceM(
+        Number.isFinite(Number(data?.nearest_city_distance_m))
+          ? Number(data.nearest_city_distance_m)
+          : null
+      );
       setNpcsInLocation(data.npcs || []);
+      setSelectedWorldMapId(locationId);
       setError(null);
     } catch (err) {
-      console.error('Failed to load zones:', err);
-      setZones([]);
+      console.error('Failed to load subzones:', err);
+      setSubzones([]);
+      setNearestCityDistanceM(null);
       setNpcsInLocation([]);
     }
   };
@@ -783,6 +989,16 @@ function App() {
       const { data } = await api.post(`/world/move/${selectedCharId}`, null, {
         params: { target_type: targetType, target_id: targetId }
       });
+
+      const normalizedTargetType = String(targetType || '').toLowerCase();
+      if (['zone', 'subzone', 'area'].includes(normalizedTargetType)) {
+        setWorld((prev) => {
+          if (!prev?.zone) return prev;
+          if (Number(prev.zone.id || 0) === Number(targetId || 0)) return prev;
+          return { ...prev, zone: null };
+        });
+      }
+
       setMovement({
         is_moving: true,
         distance_remaining: data.distance,
@@ -820,10 +1036,11 @@ function App() {
       
       if (data.arrived) {
         setError(`✓ Прибыли к цели: ${data.target_name}`);
-        // Get current location and reload zones
+        // Get current location and reload subzones
         const { data: locData } = await api.get('/world/current', { params: { character_id: selectedCharId } });
+        setWorld(locData);
         const locId = locData?.location?.id || 1;
-        await loadLocationZones(locId, selectedCharId);
+        await loadLocationSubzones(locId, selectedCharId);
         return false;
       }
       return data.is_moving;
@@ -882,12 +1099,25 @@ function App() {
           const { data: locData } = await api.get('/world/current', { params: { character_id: selectedCharId } });
           const locId = locData?.location?.id || 1;
           setWorld(locData);
-          await loadLocationZones(locId, selectedCharId);
+          setCurrentCombat(null);
+          setCombatLog([]);
+          setSelectedMobId(null);
+          await loadLocationSubzones(locId, selectedCharId);
           if (Array.isArray(data.mobs)) {
             setMobs(data.mobs);
           } else {
             await loadMobs(selectedCharId);
           }
+        }
+        if (data.action === 'exit_zone') {
+          const { data: locData } = await api.get('/world/current', { params: { character_id: selectedCharId } });
+          const locId = locData?.location?.id || 1;
+          setWorld(locData);
+          setCurrentCombat(null);
+          setCombatLog([]);
+          setSelectedMobId(null);
+          setMobs([]);
+          await loadLocationSubzones(locId, selectedCharId);
         }
       } else {
         setError(data.message);
@@ -899,24 +1129,134 @@ function App() {
 
   // ===== COMBAT FUNCTIONS =====
 
-  const attackMob = async (mobId) => {
+  const attackMob = async (mobId, abilityId = null) => {
+    if (!selectedCharId) return;
+    if (combatAttackInFlightRef.current) return null;
+    combatAttackInFlightRef.current = true;
     try {
-      const { data } = await api.post(`/combat/attack/${selectedCharId}/${mobId}`);
-      
-      const newLog = [...combatLog];
-      data.combat_log.forEach(msg => newLog.unshift(msg));
-      setCombatLog(newLog.slice(0, 50));
-      
+      const params = abilityId ? { ability_id: abilityId } : undefined;
+      const { data } = await api.post(`/combat/attack/${selectedCharId}/${mobId}`, null, { params });
+
+      const logLines = Array.isArray(data?.combat_log) ? data.combat_log.filter(Boolean) : [];
+      setCombatLog((prev) => [...logLines, ...prev].slice(0, 50));
+
+      setCurrentCombat((prev) => {
+        if (!prev) return prev;
+
+        const next = {
+          ...prev,
+          mob_health: Number(data?.mob_hp ?? prev.mob_health),
+          mob_max_health: Number(data?.mob_max_hp ?? prev.mob_max_health),
+          character_health: Number(data?.character_hp ?? prev.character_health),
+          status: 'active',
+        };
+
+        if (data?.mob_killed) {
+          next.status = 'victory';
+          next.exp_gained = Number(data?.exp_gained || 0);
+          next.gold_gained = Number(data?.gold_gained || 0);
+          next.silver_gained = Number(data?.silver_gained || 0);
+          next.can_butcher = Boolean(data?.can_butcher);
+          next.mob_health = 0;
+        }
+
+        if (data?.character_died) {
+          next.status = 'defeat';
+          next.exp_lost = Number(data?.exp_lost || 0);
+          next.death_territory = data?.death_territory || null;
+          next.dropped_items = Array.isArray(data?.dropped_items) ? data.dropped_items : [];
+        }
+
+        return next;
+      });
+
       if (data.mob_killed) {
-        setError(`☠️ +${data.exp_gained} опыта, +${data.gold_gained} золота`);
+        setError(`☠️ Победа: +${data.exp_gained || 0} опыта, +${data.gold_gained || 0} золота, +${data.silver_gained || 0} серебра`);
+        appendSystemMessage(`Последний бой: +${data.exp_gained || 0} опыта, +${data.gold_gained || 0} золота, +${data.silver_gained || 0} серебра`);
         const { data: locData } = await api.get('/world/current', { params: { character_id: selectedCharId } });
         const locId = locData?.location?.id || 1;
-        await loadLocationZones(locId, selectedCharId);
+        setWorld(locData);
+        await loadLocationSubzones(locId, selectedCharId);
+        await loadMobs(selectedCharId);
         await loadCharacters();
+        await loadInventory(selectedCharId);
       }
+
+      if (data.character_died) {
+        setError(`Персонаж погиб: -${data.exp_lost || 0} опыта`);
+        appendSystemMessage(`Поражение в бою: -${data.exp_lost || 0} опыта`);
+        await loadCharacters();
+        await loadInventory(selectedCharId);
+      }
+      return data;
     } catch (err) {
       setError(err.response?.data?.detail || 'Ошибка атаки');
+      return null;
+    } finally {
+      combatAttackInFlightRef.current = false;
     }
+  };
+
+  const clearAutoCombatTimer = () => {
+    if (autoCombatTimerRef.current) {
+      clearTimeout(autoCombatTimerRef.current);
+      autoCombatTimerRef.current = null;
+    }
+  };
+
+  const stopAutoCombat = () => {
+    setAutoCombatEnabled(false);
+    clearAutoCombatTimer();
+  };
+
+  const getAutoCombatIntervalMs = (combatSnapshot) => {
+    const rawAttackSpeed = Number(combatStats?.combat?.attack_speed || 60);
+    const attackSpeed = Number.isFinite(rawAttackSpeed) && rawAttackSpeed > 0 ? rawAttackSpeed : 60;
+    const baseInterval = 60000 / attackSpeed;
+    const tier = String(combatSnapshot?.mob_tier || '').toLowerCase();
+    const tierMultiplier = tier === 'weak'
+      ? 1.4
+      : tier === 'normal'
+        ? 1.15
+        : tier === 'strong'
+          ? 0.8
+          : tier === 'boss'
+            ? 0.65
+            : 1;
+
+    return Math.max(900, Math.min(4200, Math.round(baseInterval * tierMultiplier)));
+  };
+
+  const runAutoCombatTick = async () => {
+    if (!autoCombatEnabledRef.current) return;
+
+    const combatSnapshot = currentCombatRef.current;
+    if (!combatSnapshot || !['ready', 'active'].includes(combatSnapshot.status)) {
+      stopAutoCombat();
+      return;
+    }
+
+    const result = await attackMob(combatSnapshot.mob_id);
+    if (!autoCombatEnabledRef.current) return;
+    if (!result || result.mob_killed || result.character_died) {
+      stopAutoCombat();
+      return;
+    }
+
+    const nextSnapshot = currentCombatRef.current || combatSnapshot;
+    const delayMs = getAutoCombatIntervalMs(nextSnapshot);
+    clearAutoCombatTimer();
+    autoCombatTimerRef.current = setTimeout(runAutoCombatTick, delayMs);
+  };
+
+  const startAutoCombat = () => {
+    const combatSnapshot = currentCombatRef.current;
+    if (!combatSnapshot || !['ready', 'active'].includes(combatSnapshot.status)) return;
+    if (autoCombatEnabledRef.current) return;
+
+    setAutoCombatEnabled(true);
+    clearAutoCombatTimer();
+    autoCombatTimerRef.current = setTimeout(runAutoCombatTick, 0);
   };
 
   const loadCombatStats = async (charId = selectedCharId) => {
@@ -967,6 +1307,25 @@ function App() {
     }
   };
 
+  const increaseSingleStat = async (statName) => {
+    if (!selectedCharId) return;
+    const available = Number(combatStats?.available_stat_points || 0);
+    if (available <= 0 || allocatingStats) return;
+
+    setAllocatingStats(true);
+    try {
+      const payload = { ...EMPTY_STAT_ALLOCATION, [statName]: 1 };
+      await api.post(`/combat/stats/${selectedCharId}/allocate`, payload);
+      await loadCombatStats(selectedCharId);
+      await loadCharacters();
+      await loadWorld(selectedCharId);
+    } catch (err) {
+      setError(err?.response?.data?.detail || 'Ошибка распределения характеристик');
+    } finally {
+      setAllocatingStats(false);
+    }
+  };
+
   // ===== PARTY FUNCTIONS =====
 
   const createParty = async (partyName) => {
@@ -1007,17 +1366,23 @@ function App() {
 
   const loadNearbyPlayers = async (charId = selectedCharId) => {
     if (!charId) return;
+    if (nearbyPlayersRequestRef.current) return;
+    nearbyPlayersRequestRef.current = true;
     try {
       const { data } = await api.get(`/party/nearby-players/${charId}`);
       setNearbyPlayers(data.nearby_players || []);
     } catch (err) {
       console.error('Failed to load nearby players:', err);
       setNearbyPlayers([]);
+    } finally {
+      nearbyPlayersRequestRef.current = false;
     }
   };
 
   const loadPendingInvitations = async (charId = selectedCharId) => {
     if (!charId) return;
+    if (pendingInvitesRequestRef.current) return;
+    pendingInvitesRequestRef.current = true;
     try {
       const { data } = await api.get(`/party/invitations/pending/${charId}`);
       setPendingInvitations(data.invitations || []);
@@ -1030,6 +1395,8 @@ function App() {
     } catch (err) {
       console.error('Failed to load invitations:', err);
       setPendingInvitations([]);
+    } finally {
+      pendingInvitesRequestRef.current = false;
     }
   };
 
@@ -1111,7 +1478,33 @@ function App() {
   };
 
   const equipmentSlots = ['right_hand', 'left_hand', 'head', 'chest', 'legs', 'feet', 'ring_left', 'ring_right'];
-  const equippableItemTypes = new Set(['weapon', 'one_handed_weapon', 'two_handed_weapon', 'armor', 'shield', 'helmet', 'boots', 'gloves', 'pants', 'ring', 'accessory']);
+  const equippableItemTypes = new Set([
+    'weapon',
+    'melee_weapon',
+    'one_handed_weapon',
+    'weapon_1h',
+    'weapon_one_handed',
+    'two_handed_weapon',
+    'weapon_2h',
+    'weapon_two_handed',
+    'sword',
+    'axe',
+    'mace',
+    'bow',
+    'staff',
+    'armor',
+    'chest_armor',
+    'body_armor',
+    'robe',
+    'shield',
+    'helmet',
+    'hat',
+    'boots',
+    'gloves',
+    'pants',
+    'ring',
+    'accessory'
+  ]);
 
   const isItemEquippable = (item) => equippableItemTypes.has((item?.type || '').toLowerCase());
 
@@ -1172,8 +1565,7 @@ function App() {
     if (!selectedCharId) return;
     try {
       await api.post(`/characters/${selectedCharId}/inventory/equip`, { item_id: itemId });
-      await loadInventory(selectedCharId);
-      await loadCombatStats(selectedCharId);
+      await Promise.all([loadInventory(selectedCharId), loadCombatStats(selectedCharId)]);
       setError('Предмет экипирован');
     } catch (e) {
       setError(`Ошибка экипировки: ${e?.response?.data?.detail || e.message}`);
@@ -1184,8 +1576,7 @@ function App() {
     if (!selectedCharId) return;
     try {
       await api.post(`/characters/${selectedCharId}/inventory/unequip`, { slot });
-      await loadInventory(selectedCharId);
-      await loadCombatStats(selectedCharId);
+      await Promise.all([loadInventory(selectedCharId), loadCombatStats(selectedCharId)]);
       setError('Предмет снят');
     } catch (e) {
       setError(`Ошибка снятия: ${e?.response?.data?.detail || e.message}`);
@@ -1252,35 +1643,75 @@ function App() {
     }
   };
 
-  // Strict 3-zone model: city, hunting, resource.
-  const groupedZones = useMemo(() => {
-    const groups = {
-      city: { name: 'Город', icon: '🏛️', zones: [] },
-      hunting: { name: 'Охота', icon: '⚔️', zones: [] },
-      resource: { name: 'Добыча', icon: '⛏️', zones: [] }
-    };
+  const areaMeta = {
+    city: { name: 'Город', icon: '🏛️' },
+    hunting: { name: 'Охота', icon: '⚔️' },
+    resource: { name: 'Добыча', icon: '⛏️' }
+  };
 
-    zones.forEach(zone => {
+  // Strict 3-area model: only city, hunting, resource.
+  const subzonesByType = useMemo(() => {
+    const groups = { city: [], hunting: [], resource: [] };
+    subzones.forEach((zone) => {
       const zoneType = String(zone.type || '').toLowerCase();
       if (zoneType === 'city') {
-        groups.city.zones.push(zone);
+        groups.city.push(zone);
       } else if (zoneType === 'hunting' || zoneType === 'pack') {
-        groups.hunting.zones.push(zone);
+        groups.hunting.push(zone);
       } else if (zoneType === 'resource' || zoneType === 'mining') {
-        groups.resource.zones.push(zone);
-      } else {
-        groups.hunting.zones.push(zone);
+        groups.resource.push(zone);
       }
     });
+    return groups;
+  }, [subzones]);
 
-    return Object.entries(groups).filter(([_, group]) => group.zones.length > 0);
-  }, [zones]);
+  const cityStations = useMemo(
+    () => npcsInLocation.filter((npc) => npc.type === 'crafting_station'),
+    [npcsInLocation]
+  );
+
+  const cityNpcs = useMemo(
+    () => npcsInLocation.filter((npc) => npc.type !== 'crafting_station'),
+    [npcsInLocation]
+  );
+
+  const cityQuestNpcs = useMemo(
+    () => cityNpcs.filter((npc) => npc.type === 'quest_giver'),
+    [cityNpcs]
+  );
+
+  const cityMerchants = useMemo(
+    () => cityNpcs.filter((npc) => npc.type === 'merchant' || npc.type === 'broker'),
+    [cityNpcs]
+  );
+
+  const getResourceHint = (name = '') => {
+    const n = String(name).toLowerCase();
+    if (n.includes('шахт') || n.includes('руд')) return '⛏️ Рудная точка';
+    if (n.includes('гора') || n.includes('кам')) return '🪨 Каменная точка';
+    if (n.includes('лес') || n.includes('берез') || n.includes('дерев')) return '🌲 Лесная точка';
+    return '📦 Точка добычи';
+  };
+
+  const getMobTierLabel = (tier = '') => {
+    const normalized = String(tier || '').toLowerCase();
+    if (normalized === 'weak') return 'Слабый';
+    if (normalized === 'normal') return 'Обычный';
+    if (normalized === 'strong') return 'Сильный';
+    if (normalized === 'boss') return 'Босс';
+    return 'Обычный';
+  };
+
+  const getMobDisplayName = (mob) => {
+    const isBoss = String(mob?.mob_tier || '').toLowerCase() === 'boss' || Boolean(mob?.is_boss);
+    return isBoss ? `${mob?.name || ''} (Босс)` : (mob?.name || '');
+  };
 
   if (loading) {
     return (
       <div className="app loading-screen">
         <div className="loader"></div>
-        <h2>Загрузка Codex Online...</h2>
+        <h2>Загрузка CodeX of Honor...</h2>
       </div>
     );
   }
@@ -1288,81 +1719,312 @@ function App() {
   if (inWorld) {
     const hpPercent = selectedCharacter ? (selectedCharacter.health_points / selectedCharacter.max_health_points) * 100 : 100;
     const mpPercent = selectedCharacter ? (selectedCharacter.magic_points / selectedCharacter.max_magic_points) * 100 : 100;
+    const activeZoneId = Number(world?.zone?.id || 0);
+    const activeCityZone = subzonesByType.city.find((zone) => Number(zone.zone_id) === activeZoneId) || null;
+    const isInCityZone = Boolean(activeCityZone);
+    const cityZonesSorted = [...subzonesByType.city].sort((a, b) => Number(a.distance || 0) - Number(b.distance || 0));
+    const nearestCityZone = (isInCityZone
+      ? cityZonesSorted[0]
+      : cityZonesSorted.find((zone) => Number(zone.distance || 0) > 0) || cityZonesSorted[0]) || null;
+    const nearestCityDistanceDisplay = (() => {
+      if (Number.isFinite(Number(nearestCityDistanceM))) {
+        const value = Number(nearestCityDistanceM);
+        if (!isInCityZone && value <= 0) {
+          const fallback = Number(nearestCityZone?.distance || 0);
+          return fallback > 0 ? fallback : value;
+        }
+        return value;
+      }
+      const fallback = Number(nearestCityZone?.distance || 0);
+      return Number.isFinite(fallback) ? fallback : null;
+    })();
+    const activeHuntingZoneId = subzonesByType.hunting.some((zone) => Number(zone.zone_id) === activeZoneId)
+      ? activeZoneId
+      : 0;
 
     // Tab content render helper
     const renderTabContent = () => {
       switch(activeTab) {
-        case 'zones':
+        case 'world':
           return (
             <div className="zones-shell">
               <div className="zones-subtabs">
                 <button
-                  className={`zones-subtab ${zonesSubTab === 'location' ? 'active' : ''}`}
-                  onClick={() => setZonesSubTab('location')}
+                  className={`zones-subtab ${worldSubTab === 'worldmap' ? 'active' : ''}`}
+                  onClick={() => setWorldSubTab('worldmap')}
                 >
-                  Локация
+                  Мир ({worldMapCards.length})
                 </button>
                 <button
-                  className={`zones-subtab ${zonesSubTab === 'zones' ? 'active' : ''}`}
-                  onClick={() => setZonesSubTab('zones')}
+                  className={`zones-subtab ${worldSubTab === 'city' ? 'active' : ''}`}
+                  onClick={() => setWorldSubTab('city')}
                 >
-                  Зоны ({zones.length})
+                  Город ({subzonesByType.city.length})
                 </button>
                 <button
-                  className={`zones-subtab ${zonesSubTab === 'npcs' ? 'active' : ''}`}
-                  onClick={() => setZonesSubTab('npcs')}
+                  className={`zones-subtab ${worldSubTab === 'hunting' ? 'active' : ''}`}
+                  onClick={() => setWorldSubTab('hunting')}
                 >
-                  НПС ({npcsInLocation.length})
+                  Охота ({subzonesByType.hunting.length})
+                </button>
+                <button
+                  className={`zones-subtab ${worldSubTab === 'resource' ? 'active' : ''}`}
+                  onClick={() => setWorldSubTab('resource')}
+                >
+                  Добыча ({subzonesByType.resource.length})
                 </button>
               </div>
 
               <div className="zones-subtab-content">
-                {zonesSubTab === 'location' && (
+                {worldSubTab === 'worldmap' && (
+                  <div>
+                    <h3>Карты мира</h3>
+                    {worldMapCards.length === 0 ? (
+                      <p style={{ color: '#888' }}>Карты мира не найдены.</p>
+                    ) : (
+                      <div className="zone-list">
+                        {worldMapCards.map((loc) => (
+                          <div key={loc.name} className="zone-item">
+                            <div className="zone-info">
+                              <div className="zone-name">
+                                <EntityIcon
+                                  name={loc.name === 'Аурис' ? 'Город новичков Аурис' : loc.name}
+                                  category="objects"
+                                  iconsIndex={generatedIcons}
+                                  fallback={loc.name === 'Аурис' ? '🏙️' : '🌍'}
+                                />{' '}
+                                {loc.name}
+                                {loc.id && selectedWorldMapId === loc.id ? ' (текущая)' : ''}
+                                <span
+                                  style={{
+                                    marginLeft: '8px',
+                                    padding: '2px 8px',
+                                    borderRadius: '999px',
+                                    fontSize: '11px',
+                                    fontWeight: 700,
+                                    color: loc.inDevelopment ? '#ffd7d7' : '#d9ffef',
+                                    background: loc.inDevelopment ? 'rgba(255, 82, 82, 0.22)' : 'rgba(16, 185, 129, 0.22)',
+                                    border: loc.inDevelopment ? '1px solid rgba(255, 110, 110, 0.5)' : '1px solid rgba(52, 211, 153, 0.5)',
+                                  }}
+                                >
+                                  {loc.status}
+                                </span>
+                              </div>
+                              <div className="zone-details">
+                                <span>Уровни: {loc.levelRange}</span>
+                                <span>Тип: {loc.typeLabel}</span>
+                                <span>Статус: {loc.status}</span>
+                              </div>
+                            </div>
+                            <div className="zone-actions">
+                              <button
+                                className={`btn-small ${loc.inDevelopment ? '' : 'btn-primary'}`}
+                                disabled={loc.inDevelopment || !loc.id}
+                                onClick={async () => {
+                                  if (loc.inDevelopment || !loc.id) return;
+                                  await loadLocationSubzones(loc.id, selectedCharId);
+                                  setWorldSubTab('city');
+                                  setCityTab('npcs');
+                                  setCityInteractionsActive(false);
+                                }}
+                              >
+                                {loc.inDevelopment ? 'В разработке' : 'Открыть зоны'}
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {worldSubTab === 'city' && (
                   <div className="location-overview">
                     <h3>
                       <EntityIcon
-                        name={world?.location?.name || 'Локация'}
+                        name={'Город новичков Аурис'}
                         category="objects"
                         iconsIndex={generatedIcons}
-                        fallback="🗺️"
+                        fallback="🏙️"
                       />{' '}
-                      {world?.location?.name || 'Текущая локация'}
+                      {'Город новичков Аурис'}
                     </h3>
-                    <p>{world?.location?.description || 'Осмотритесь и выберите направление: зона охоты, ремесленная точка или NPC.'}</p>
-                    <p style={{ color: '#9ca3af', marginTop: '8px' }}>
-                      Текущая зона: <strong>{world?.zone?.name || 'не выбрана'}</strong>
-                    </p>
+                    <p>{world?.location?.description || 'Городская область: здесь доступны НПС и ремесленные станки.'}</p>
                     <div className="location-overview-stats">
-                      <span>🗺️ Зон: {zones.length}</span>
-                      <span>👥 НПС: {npcsInLocation.length}</span>
-                      <span>🏃 {movement.is_moving ? `Движение к ${movement.target_name}` : 'Вы на месте'}</span>
-                    </div>
-                    <div className="tutorial-actions" style={{ marginTop: '14px' }}>
-                      <button className="btn btn-primary" onClick={() => setZonesSubTab('zones')}>Открыть зоны</button>
-                      <button className="btn btn-secondary" onClick={() => setZonesSubTab('npcs')}>Открыть НПС</button>
+                      <span>🛠️ Станки: {cityStations.length}</span>
+                      <span>👥 НПС: {cityNpcs.length}</span>
+                      <span>
+                        🏙️ До Ауриса: {Number.isFinite(Number(nearestCityDistanceDisplay))
+                          ? `${Number(nearestCityDistanceDisplay).toFixed(1)}м`
+                          : 'нет данных'}
+                      </span>
+                      {movement.is_moving && <span>🏃 Движение к {movement.target_name}</span>}
                     </div>
 
+                    {!isInCityZone && nearestCityZone && (
+                      <div style={{ marginTop: '12px' }}>
+                        <div style={{ marginBottom: '8px', opacity: 0.9 }}>
+                          Ближайшая городская зона: <strong>{nearestCityZone.name}</strong> ({Number(nearestCityZone.distance || 0).toFixed(1)}м)
+                        </div>
+                        <button
+                          className="btn-small btn-primary"
+                          onClick={() => {
+                            if (nearestCityZone.can_interact) {
+                              interactWithObject('subzone', nearestCityZone.zone_id, 'enter');
+                            } else {
+                              startMovement('subzone', nearestCityZone.zone_id, nearestCityZone.name);
+                            }
+                          }}
+                        >
+                          {nearestCityZone.can_interact ? 'Войти в город' : 'Сблизиться с городом'}
+                        </button>
+                      </div>
+                    )}
+
                     <div style={{ marginTop: '18px' }}>
-                      <h4>Мобы в текущей зоне</h4>
-                      {mobs.length === 0 ? (
-                        <p style={{ color: '#888' }}>Мобов не видно. Войдите в зону охоты, чтобы увидеть врагов.</p>
+                      <div className="zones-subtabs" style={{ marginBottom: '12px' }}>
+                        <button
+                          className={`zones-subtab ${cityTab === 'npcs' ? 'active' : ''}`}
+                          onClick={() => setCityTab('npcs')}
+                        >
+                          НПС и квесты
+                        </button>
+                        <button
+                          className={`zones-subtab ${cityTab === 'stations' ? 'active' : ''}`}
+                          onClick={() => setCityTab('stations')}
+                        >
+                          Станки
+                        </button>
+                      </div>
+
+                      {isInCityZone && !cityInteractionsActive && (
+                        <div style={{ marginTop: '10px' }}>
+                          <button
+                            className="btn-small btn-primary"
+                            onClick={() => setCityInteractionsActive(true)}
+                          >
+                            Активировать городские взаимодействия
+                          </button>
+                        </div>
+                      )}
+                      {!isInCityZone && (
+                        <p style={{ color: '#888', marginTop: '10px' }}>
+                          Вы находитесь вне городской зоны. Сначала подойдите к Аурису и войдите в город.
+                        </p>
+                      )}
+                    </div>
+
+                    {cityTab === 'npcs' && (
+                      <div style={{ marginTop: '18px' }}>
+                        <h4>Квестовые НПС</h4>
+                        {isInCityZone && !cityInteractionsActive && (
+                          <p style={{ color: '#888' }}>Сначала нажмите «Активировать городские взаимодействия», чтобы открыть квестовых НПС.</p>
+                        )}
+                        {isInCityZone && cityInteractionsActive && cityQuestNpcs.length === 0 && (
+                          <p style={{ color: '#888' }}>В этой городской области пока нет квестовых НПС.</p>
+                        )}
+                        {isInCityZone && cityInteractionsActive && cityQuestNpcs.length > 0 && (
+                          <div className="zone-list">
+                            {cityQuestNpcs.map((npc) => {
+                              const npcId = npc.npc_id;
+
+                              return (
+                                <div key={npcId} className="zone-item">
+                                  <div className="zone-info">
+                                    <div className="zone-name">
+                                      <EntityIcon
+                                        name={npc.name}
+                                        category="npcs"
+                                        iconsIndex={generatedIcons}
+                                        fallback="👤"
+                                      />{' '}
+                                      {npc.name}
+                                    </div>
+                                    <div className="zone-details">
+                                      <span>Тип: {npc.type}</span>
+                                      {npc.interaction_options?.length > 0 && <span>{npc.interaction_options.join(', ')}</span>}
+                                    </div>
+                                  </div>
+                                  <div className="zone-actions">
+                                    <button className="btn-small btn-primary" onClick={() => interactWithObject('npc', npcId, 'quest')}>
+                                      Квесты
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {cityTab === 'npcs' && (
+                      <div style={{ marginTop: '18px' }}>
+                        <h4>Торговцы</h4>
+                        {isInCityZone && !cityInteractionsActive && (
+                          <p style={{ color: '#888' }}>Сначала нажмите «Активировать городские взаимодействия», чтобы открыть торговлю.</p>
+                        )}
+                        {isInCityZone && cityInteractionsActive && cityMerchants.length === 0 && (
+                          <p style={{ color: '#888' }}>В этой городской области пока нет торговцев.</p>
+                        )}
+                        {isInCityZone && cityInteractionsActive && cityMerchants.length > 0 && (
+                          <div className="zone-list">
+                            {cityMerchants.map((npc) => {
+                              const npcId = npc.npc_id;
+                              const npcAction = npc.type === 'broker' ? 'auction' : 'buy';
+
+                              return (
+                                <div key={npcId} className="zone-item">
+                                  <div className="zone-info">
+                                    <div className="zone-name">
+                                      <EntityIcon
+                                        name={npc.name}
+                                        category="npcs"
+                                        iconsIndex={generatedIcons}
+                                        fallback="👤"
+                                      />{' '}
+                                      {npc.name}
+                                    </div>
+                                    <div className="zone-details">
+                                      <span>Тип: {npc.type}</span>
+                                      {npc.interaction_options?.length > 0 && <span>{npc.interaction_options.join(', ')}</span>}
+                                    </div>
+                                  </div>
+                                  <div className="zone-actions">
+                                    <button className="btn-small btn-primary" onClick={() => interactWithObject('npc', npcId, npcAction)}>
+                                      {npcAction === 'buy' ? 'Купить' : 'Аукцион'}
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {cityTab === 'stations' && (
+                    <div style={{ marginTop: '18px' }}>
+                      <h4>Станки</h4>
+                      {!isInCityZone ? (
+                        <p style={{ color: '#888' }}>Станки доступны только внутри городской зоны.</p>
+                      ) : cityStations.length === 0 ? (
+                        <p style={{ color: '#888' }}>В этой городской области станки не найдены.</p>
                       ) : (
                         <div className="zone-list">
-                          {mobs.map((mob) => (
-                            <div key={mob.id} className="zone-item">
+                          {cityStations.map((npc) => (
+                            <div key={npc.npc_id} className="zone-item">
                               <div className="zone-info">
                                 <div className="zone-name">
-                                  <EntityIcon name={mob.name} category="mobs" iconsIndex={generatedIcons} fallback="🐾" /> {mob.name}
+                                  <EntityIcon name={npc.name} category="objects" iconsIndex={generatedIcons} fallback="🛠️" /> {npc.name}
                                 </div>
                                 <div className="zone-details">
-                                  <span>⭐ Ур. {mob.level}</span>
-                                  <span>❤️ {mob.health}/{mob.max_health}</span>
-                                  <span>⚔️ {mob.damage_min}-{mob.damage_max}</span>
+                                  <span>Тип: станок</span>
                                 </div>
                               </div>
                               <div className="zone-actions">
-                                <button className="btn-small btn-primary" onClick={() => attackMob(mob.id)}>
-                                  Атаковать
+                                <button className="btn-small btn-primary" onClick={() => interactWithObject('npc', npc.npc_id, 'craft')}>
+                                  Крафт
                                 </button>
                               </div>
                             </div>
@@ -1370,110 +2032,127 @@ function App() {
                         </div>
                       )}
                     </div>
-                  </div>
-                )}
-
-                {zonesSubTab === 'zones' && (
-                  <div>
-                    {groupedZones.length === 0 && (
-                      <p style={{ color: '#888' }}>Зоны не найдены для текущей локации.</p>
                     )}
-                    {groupedZones.map(([type, group]) => (
-                      <div key={type} className="zone-group">
-                        <div className="zone-group-header">
-                          <span className="zone-group-icon">{group.icon}</span>
-                          <span className="zone-group-title">{group.name}</span>
-                          <span className="zone-group-count">{group.zones.length}</span>
-                        </div>
-                        <div className="zone-list">
-                          {group.zones.map((zone) => (
-                            <div key={zone.zone_id} className="zone-item">
-                              <div className="zone-info">
-                                <div className="zone-name">
-                                  <EntityIcon
-                                    name={zone.name}
-                                    category="objects"
-                                    iconsIndex={generatedIcons}
-                                    fallback="🗺️"
-                                  />{' '}
-                                  {zone.name}
-                                </div>
-                                <div className="zone-details">
-                                  <span>{zone.is_aggressive ? '⚔️ Агрессивная' : '🌿 Мирная'}</span>
-                                  <span>📏 {zone.distance}м</span>
-                                  <span>⭐ {zone.level_range}</span>
-                                </div>
-                              </div>
-                              <div className="zone-actions">
-                                {zone.can_interact ? (
-                                  <button className="btn-small btn-success" onClick={() => interactWithObject('zone', zone.zone_id, 'enter')}>
-                                    Войти
-                                  </button>
-                                ) : (
-                                  <button className="btn-small" onClick={() => startMovement('zone', zone.zone_id, zone.name)}>
-                                    Идти
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    ))}
                   </div>
                 )}
 
-                {zonesSubTab === 'npcs' && (
+                {(worldSubTab === 'hunting' || worldSubTab === 'resource') && (
                   <div>
-                    {npcsInLocation.length === 0 ? (
-                      <p style={{ color: '#888' }}>В этой локации пока нет доступных НПС.</p>
-                    ) : (
+                    <div style={{ marginBottom: '10px', opacity: 0.9 }}>
+                      🏙️ До ближайшего города:{' '}
+                      {Number.isFinite(Number(nearestCityDistanceDisplay))
+                        ? `${Number(nearestCityDistanceDisplay).toFixed(1)}м`
+                        : 'нет данных'}
+                    </div>
+                    {(() => {
+                      const zonesForTab = worldSubTab === 'hunting' && activeHuntingZoneId
+                        ? subzonesByType.hunting.filter((zone) => Number(zone.zone_id) === activeHuntingZoneId)
+                        : subzonesByType[worldSubTab];
+                      return (
+                        <>
+                    {zonesForTab.length === 0 && (
+                      <p style={{ color: '#888' }}>
+                        {worldSubTab === 'hunting'
+                          ? 'Охотничьи локации не найдены для текущей области.'
+                          : 'Точки добычи не найдены для текущей области.'}
+                      </p>
+                    )}
+                    <div className="zone-group">
+                      <div className="zone-group-header">
+                        <span className="zone-group-icon">{areaMeta[worldSubTab].icon}</span>
+                        <span className="zone-group-title">{areaMeta[worldSubTab].name}</span>
+                        <span className="zone-group-count">{zonesForTab.length}</span>
+                      </div>
                       <div className="zone-list">
-                        {npcsInLocation.map((npc) => {
-                          const npcId = npc.npc_id;
-                          const npcType = npc.type;
-                          const npcAction = npcType === 'quest_giver'
-                            ? 'quest'
-                            : npcType === 'merchant'
-                              ? 'buy'
-                              : npcType === 'broker'
-                                ? 'auction'
-                                : npcType === 'crafting_station'
-                                  ? 'craft'
-                                  : null;
-
-                          return (
-                            <div key={npcId} className="zone-item">
-                              <div className="zone-info">
-                                <div className="zone-name">
-                                  <EntityIcon
-                                    name={npc.name}
-                                    category="npcs"
-                                    iconsIndex={generatedIcons}
-                                    fallback="👤"
-                                  />{' '}
-                                  {npc.name}
-                                </div>
-                                <div className="zone-details">
-                                  <span>📏 {npc.distance}м</span>
-                                  <span>Тип: {npc.type}</span>
-                                  {npc.interaction_options?.length > 0 && <span>{npc.interaction_options.join(', ')}</span>}
-                                </div>
+                        {zonesForTab.map((zone) => (
+                          <div key={zone.zone_id} className="zone-item">
+                            <div className="zone-info">
+                              <div className="zone-name">
+                                <EntityIcon
+                                  name={zone.name}
+                                  category="objects"
+                                  iconsIndex={generatedIcons}
+                                  fallback={worldSubTab === 'hunting' ? '🐾' : '⛏️'}
+                                />{' '}
+                                {zone.name}
                               </div>
-                              <div className="zone-actions">
-                                {npc.can_interact && npcAction ? (
-                                  <button className="btn-small btn-primary" onClick={() => interactWithObject('npc', npcId, npcAction)}>
-                                    {npcAction === 'quest' ? 'Квесты' : npcAction === 'buy' ? 'Купить' : npcAction === 'craft' ? 'Крафт' : 'Аукцион'}
-                                  </button>
-                                ) : (
-                                  <button className="btn-small" onClick={() => startMovement('npc', npcId, npc.name)}>
-                                    Идти
-                                  </button>
-                                )}
+                              <div className="zone-details">
+                                <span>📏 {zone.distance}м</span>
+                                <span>⭐ {zone.level_range}</span>
+                                {worldSubTab === 'resource' && <span>{getResourceHint(zone.name)}</span>}
                               </div>
                             </div>
-                          );
-                        })}
+                            <div className="zone-actions">
+                              {activeZoneId === Number(zone.zone_id) ? (
+                                <button
+                                  className="btn-small btn-danger"
+                                  onClick={() => interactWithObject('subzone', activeZoneId || zone.zone_id, 'exit_zone')}
+                                >
+                                  Выйти
+                                </button>
+                              ) : zone.can_interact ? (
+                                <button className="btn-small btn-success" onClick={() => interactWithObject('subzone', zone.zone_id, 'enter')}>
+                                  Войти
+                                </button>
+                              ) : (
+                                <button className="btn-small" onClick={() => startMovement('subzone', zone.zone_id, zone.name)}>
+                                  Идти
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                        </>
+                      );
+                    })()}
+
+                    {worldSubTab === 'hunting' && (
+                      <div style={{ marginTop: '16px' }}>
+                        <h4>Мобы в зоне</h4>
+                        {mobs.length === 0 ? (
+                          <p style={{ color: '#888' }}>Войдите в зону охоты, чтобы увидеть типы мобов и счетчики респавна.</p>
+                        ) : (
+                          <div className="zone-list">
+                            {mobs.map((mob) => (
+                              <div key={mob.id} className="zone-item">
+                                <div className="zone-info">
+                                  <div className="zone-name">
+                                    {String(mob.mob_tier || '').toLowerCase() === 'boss' ? '😈 ' : ''}
+                                    <EntityIcon
+                                      name={getMobDisplayName(mob)}
+                                      category="mobs"
+                                      iconsIndex={generatedIcons}
+                                      fallback={String(mob.mob_tier || '').toLowerCase() === 'boss' ? '😈' : '🐺'}
+                                    />{' '}
+                                    {getMobDisplayName(mob)}
+                                  </div>
+                                  <div className="zone-details">
+                                    <span>⭐ Уровень: {mob.level}</span>
+                                    <span>🏷️ Тип: {getMobTierLabel(mob.mob_tier)}</span>
+                                    <span>📊 Живые: {mob.alive_count ?? 0}/{mob.total_count ?? 0}</span>
+                                    <span>⏱️ Респавн: {mob.respawn_seconds ?? 0}с/ед.</span>
+                                    {(mob.alive_count ?? 0) < (mob.total_count ?? 0) && (
+                                      <span>⌛ До следующего: {mob.next_respawn_in_seconds ?? 0}с</span>
+                                    )}
+                                    {!!mob.party_required && <span>👥 Только в пати</span>}
+                                    {String(mob.mob_tier || '').toLowerCase() === 'boss' && <span>⚠️ Рекомендуется группа</span>}
+                                  </div>
+                                </div>
+                                <div className="zone-actions">
+                                  <button
+                                    className={`btn-small ${selectedMobId === mob.id ? 'btn-success' : 'btn-primary'}`}
+                                    disabled={(mob.alive_count ?? 0) <= 0}
+                                    onClick={() => selectMobForCombat(mob)}
+                                  >
+                                    {(mob.alive_count ?? 0) <= 0 ? 'Истреблен' : 'Атаковать'}
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -1481,6 +2160,116 @@ function App() {
               </div>
             </div>
           );
+
+        case 'chat': {
+          const activeChannelMessages = chatSubTab === 'system'
+            ? systemChatMessages
+            : (chatMessagesByChannel[chatSubTab] || []);
+          const worldChannelLabel = chatChannels.find((c) => c.id === 'world')?.label || 'Мир - Аурис';
+
+          return (
+            <div>
+              <h3>💬 Глобальный чат</h3>
+              <div className="zones-subtabs" style={{ marginBottom: '12px' }}>
+                <button
+                  className={`zones-subtab ${chatSubTab === 'world' ? 'active' : ''}`}
+                  onClick={async () => {
+                    setChatSubTab('world');
+                    await loadChatHistory('world');
+                  }}
+                >
+                  {worldChannelLabel}
+                </button>
+                <button
+                  className={`zones-subtab ${chatSubTab === 'help' ? 'active' : ''}`}
+                  onClick={async () => {
+                    setChatSubTab('help');
+                    await loadChatHistory('help');
+                  }}
+                >
+                  Помощь новичка
+                </button>
+                <button
+                  className={`zones-subtab ${chatSubTab === 'trade' ? 'active' : ''}`}
+                  onClick={async () => {
+                    setChatSubTab('trade');
+                    await loadChatHistory('trade');
+                  }}
+                >
+                  Торговля
+                </button>
+                <button
+                  className={`zones-subtab ${chatSubTab === 'system' ? 'active' : ''}`}
+                  onClick={() => setChatSubTab('system')}
+                >
+                  Системный
+                </button>
+              </div>
+
+              <div
+                style={{
+                  minHeight: '320px',
+                  maxHeight: '420px',
+                  overflowY: 'auto',
+                  border: '1px solid #2d3748',
+                  borderRadius: '10px',
+                  padding: '10px',
+                  background: '#0f172a'
+                }}
+              >
+                {chatLoading && chatSubTab !== 'system' && <p style={{ color: '#94a3b8' }}>Загрузка чата...</p>}
+                {!chatLoading && activeChannelMessages.length === 0 && (
+                  <p style={{ color: '#94a3b8' }}>
+                    {chatSubTab === 'system'
+                      ? 'Системных событий пока нет.'
+                      : 'Сообщений пока нет. Напишите первым.'}
+                  </p>
+                )}
+                {activeChannelMessages.map((msg) => {
+                  const dt = msg?.created_at ? new Date(msg.created_at) : null;
+                  const tm = dt && !Number.isNaN(dt.getTime())
+                    ? dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                    : '--:--';
+                  const text = msg?.text || msg?.message || '';
+                  const sender = msg?.sender_name || 'Система';
+                  return (
+                    <div key={msg.id || `${tm}_${text}`} style={{ marginBottom: '8px', paddingBottom: '8px', borderBottom: '1px solid #1e293b' }}>
+                      <div style={{ fontSize: '12px', color: '#94a3b8', marginBottom: '2px' }}>[{tm}] {sender}</div>
+                      <div style={{ whiteSpace: 'pre-wrap', color: '#e2e8f0' }}>{text}</div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {chatSubTab !== 'system' && (
+                <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
+                  <input
+                    type="text"
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        sendChatMessage();
+                      }
+                    }}
+                    maxLength={400}
+                    placeholder="Введите сообщение..."
+                    style={{
+                      flex: 1,
+                      padding: '10px',
+                      borderRadius: '8px',
+                      border: '1px solid #334155',
+                      background: '#0b1220',
+                      color: '#e2e8f0'
+                    }}
+                  />
+                  <button className="btn btn-primary" onClick={sendChatMessage}>Отправить</button>
+                </div>
+              )}
+            </div>
+          );
+        }
 
         case 'inventory':
           return (
@@ -1493,6 +2282,15 @@ function App() {
                       <div className="equipment-slot-title">{slotLabels[slot] || slot}</div>
                       {equipped ? (
                         <>
+                          <EntityIcon
+                            name={equipped.name}
+                            category="items"
+                            iconsIndex={generatedIcons}
+                            resolver={getItemIcon}
+                            className="item-icon-img"
+                            fallback={equipped.icon || '📦'}
+                            fallbackClassName="item-icon"
+                          />
                           <div className="equipment-item-name" title={buildItemTooltip(equipped)}>{equipped.name}</div>
                           <button className="btn-small" onClick={() => unequipItem(slot)}>Снять</button>
                         </>
@@ -1592,52 +2390,84 @@ function App() {
                     <tbody>
                       <tr>
                         <td title="Влияет на физический урон и силу ударов">💪 Сила:</td>
-                        <td>{combatStats.stats.strength}</td>
+                        <td style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <span>{combatStats.stats.strength}</span>
+                          <button
+                            className="btn-small"
+                            onClick={() => increaseSingleStat('strength')}
+                            disabled={allocatingStats || Number(combatStats.available_stat_points || 0) <= 0}
+                          >
+                            +
+                          </button>
+                        </td>
                       </tr>
                       <tr>
                         <td title="Влияет на шанс попадания, блок и скорость атаки">🏃 Ловкость:</td>
-                        <td>{combatStats.stats.dexterity}</td>
+                        <td style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <span>{combatStats.stats.dexterity}</span>
+                          <button
+                            className="btn-small"
+                            onClick={() => increaseSingleStat('dexterity')}
+                            disabled={allocatingStats || Number(combatStats.available_stat_points || 0) <= 0}
+                          >
+                            +
+                          </button>
+                        </td>
                       </tr>
                       <tr>
                         <td title="Влияет на запас здоровья и снижение входящего урона">🛡️ Выносливость:</td>
-                        <td>{combatStats.stats.constitution}</td>
+                        <td style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <span>{combatStats.stats.constitution}</span>
+                          <button
+                            className="btn-small"
+                            onClick={() => increaseSingleStat('constitution')}
+                            disabled={allocatingStats || Number(combatStats.available_stat_points || 0) <= 0}
+                          >
+                            +
+                          </button>
+                        </td>
                       </tr>
                       <tr>
                         <td title="Влияет на магический потенциал и эффективность умений">🧠 Интеллект:</td>
-                        <td>{combatStats.stats.intelligence}</td>
+                        <td style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <span>{combatStats.stats.intelligence}</span>
+                          <button
+                            className="btn-small"
+                            onClick={() => increaseSingleStat('intelligence')}
+                            disabled={allocatingStats || Number(combatStats.available_stat_points || 0) <= 0}
+                          >
+                            +
+                          </button>
+                        </td>
                       </tr>
                       <tr>
                         <td title="Влияет на поддержку, восстановление и магическую устойчивость">📿 Мудрость:</td>
-                        <td>{combatStats.stats.wisdom}</td>
+                        <td style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <span>{combatStats.stats.wisdom}</span>
+                          <button
+                            className="btn-small"
+                            onClick={() => increaseSingleStat('wisdom')}
+                            disabled={allocatingStats || Number(combatStats.available_stat_points || 0) <= 0}
+                          >
+                            +
+                          </button>
+                        </td>
                       </tr>
                       <tr>
                         <td title="Влияет на критические эффекты и редкие шансы">🎲 Удача:</td>
-                        <td>{combatStats.stats.luck}</td>
+                        <td style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <span>{combatStats.stats.luck}</span>
+                          <button
+                            className="btn-small"
+                            onClick={() => increaseSingleStat('luck')}
+                            disabled={allocatingStats || Number(combatStats.available_stat_points || 0) <= 0}
+                          >
+                            +
+                          </button>
+                        </td>
                       </tr>
                     </tbody>
                   </table>
-
-                  {(combatStats.available_stat_points || 0) > 0 && (
-                    <div style={{ marginTop: '16px', border: '1px solid rgba(255,255,255,0.15)', borderRadius: '8px', padding: '12px' }}>
-                      <h4 style={{ margin: '0 0 10px 0' }}>Распределение очков</h4>
-                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(160px, 1fr))', gap: '8px' }}>
-                        <label>Сила: <input type="number" min="0" value={statAllocation.strength} onChange={(e) => updateStatAllocation('strength', e.target.value)} /></label>
-                        <label>Ловкость: <input type="number" min="0" value={statAllocation.dexterity} onChange={(e) => updateStatAllocation('dexterity', e.target.value)} /></label>
-                        <label>Выносливость: <input type="number" min="0" value={statAllocation.constitution} onChange={(e) => updateStatAllocation('constitution', e.target.value)} /></label>
-                        <label>Интеллект: <input type="number" min="0" value={statAllocation.intelligence} onChange={(e) => updateStatAllocation('intelligence', e.target.value)} /></label>
-                        <label>Мудрость: <input type="number" min="0" value={statAllocation.wisdom} onChange={(e) => updateStatAllocation('wisdom', e.target.value)} /></label>
-                        <label>Удача: <input type="number" min="0" value={statAllocation.luck} onChange={(e) => updateStatAllocation('luck', e.target.value)} /></label>
-                      </div>
-                      <div style={{ marginTop: '10px', display: 'flex', gap: '8px', alignItems: 'center' }}>
-                        <button className="btn btn-success" onClick={allocateStatPoints} disabled={allocatingStats}>
-                          {allocatingStats ? '⏳ Применение...' : 'Применить распределение'}
-                        </button>
-                        <span style={{ opacity: 0.9 }}>
-                          К распределению: {Object.values(statAllocation).reduce((sum, value) => sum + (Number(value) || 0), 0)}
-                        </span>
-                      </div>
-                    </div>
-                  )}
                 </div>
               )}
             </div>
@@ -1767,11 +2597,11 @@ function App() {
                   <button
                     className="btn btn-primary"
                     onClick={() => {
-                      setActiveTab('zones');
-                      setError('Осмотритесь в зонах: подойдите к NPC-квестодателю или перейдите в другую локацию.');
+                      setActiveTab('world');
+                      setError('Осмотритесь в областях: подойдите к NPC-квестодателю или перейдите в другую локацию.');
                     }}
                   >
-                    Перейти в зоны
+                    Перейти в мир
                   </button>
                 </div>
               ) : (
@@ -2027,7 +2857,7 @@ function App() {
         <header className="header">
           <div className="header-content">
             <div className="logo">
-              <h1>Codex Online</h1>
+              <h1>CodeX of Honor</h1>
               <p>{selectedCharacter?.name} - {world?.location?.name}</p>
             </div>
             <div className="user-info">
@@ -2088,7 +2918,7 @@ function App() {
               <button className="tutorial-close" onClick={closeTutorial}>Скрыть</button>
             </div>
             <p className="tutorial-text">
-              Добро пожаловать в Codex Online. Твой путь героя начинается с простого цикла: найти квест, выполнить цель и сдать награду.
+              Добро пожаловать в CodeX of Honor. Твой путь героя начинается с простого цикла: найти квест, выполнить цель и получить награду.
             </p>
             <div className="tutorial-steps">
               <div className={`tutorial-step ${tutorialProgress.openedQuestsTab ? 'done' : ''}`}>
@@ -2098,7 +2928,7 @@ function App() {
                 2. Прими первый квест у квестодателя в локации.
               </div>
               <div className="tutorial-step">
-                3. Перейди в зону охоты, атакуй мобов и выполни условия.
+                3. Перейди в область охоты, атакуй мобов и выполни условия.
               </div>
               <div className={`tutorial-step ${tutorialProgress.completedQuest ? 'done' : ''}`}>
                 4. Сдай квест во вкладке квестов и получи опыт, золото и коины.
@@ -2130,10 +2960,10 @@ function App() {
         {/* Tab Navigation */}
         <div className="game-tabs">
           <button 
-            className={`game-tab ${activeTab === 'zones' ? 'active' : ''}`}
-            onClick={() => setActiveTab('zones')}
+            className={`game-tab ${activeTab === 'world' ? 'active' : ''}`}
+            onClick={() => setActiveTab('world')}
           >
-            🗺️ Зоны
+            🗺️ Мир
           </button>
           <button 
             className={`game-tab ${activeTab === 'inventory' ? 'active' : ''}`}
@@ -2166,6 +2996,12 @@ function App() {
             👥 <span className={pendingInvitesCount > 0 && activeTab !== 'party' ? 'party-tab-alert' : ''}>Группа</span>
             {partyInfo && ` (${partyInfo.current_members})`}
             {!partyInfo && pendingInvitesCount > 0 && ` (${pendingInvitesCount})`}
+          </button>
+          <button
+            className={`game-tab ${activeTab === 'chat' ? 'active' : ''}`}
+            onClick={() => setActiveTab('chat')}
+          >
+            💬 Чат
           </button>
         </div>
 
@@ -2210,6 +3046,80 @@ function App() {
                     ))}
                   </div>
                 </div>
+
+                {(currentCombat.status === 'ready' || currentCombat.status === 'active') && (
+                  <div style={{ marginTop: '14px', display: 'flex', gap: '8px' }}>
+                    {!autoCombatEnabled ? (
+                      <button className="btn btn-success" onClick={startAutoCombat}>
+                        Автобой до конца
+                      </button>
+                    ) : (
+                      <button className="btn btn-danger" onClick={stopAutoCombat}>
+                        Остановить автобой
+                      </button>
+                    )}
+                    <button className="btn" onClick={leaveCombat}>
+                      Уйти
+                    </button>
+                  </div>
+                )}
+
+                {(currentCombat.status === 'ready' || currentCombat.status === 'active') && autoCombatEnabled && (
+                  <p style={{ marginTop: '8px', fontSize: '12px', color: '#86efac' }}>
+                    Автобой активен: атаки продолжаются до финала боя.
+                  </p>
+                )}
+
+                {currentCombat.status === 'victory' && (
+                  <div style={{ marginTop: '12px' }}>
+                    <h5>Награда</h5>
+                    <p style={{ margin: '6px 0' }}>Опыт: +{currentCombat.exp_gained || 0}</p>
+                    <p style={{ margin: '6px 0' }}>Золото: +{currentCombat.gold_gained || 0}</p>
+                    <p style={{ margin: '6px 0' }}>Серебро: +{currentCombat.silver_gained || 0}</p>
+
+                    {currentCombat.can_butcher && !currentCombat.butchered && (
+                      <button className="btn btn-primary" onClick={() => butcherMob(currentCombat.mob_id)}>
+                        Разделка
+                      </button>
+                    )}
+
+                    {currentCombat.butchered && (
+                      <p style={{ marginTop: '8px' }}>
+                        Ресурсы получены: {(currentCombat.butchered_items || []).map((i) => `${i.name}x${i.quantity}`).join(', ') || 'нет'}
+                      </p>
+                    )}
+
+                    {(!currentCombat.can_butcher || currentCombat.butchered) && (
+                      <button className="btn btn-success" onClick={finishCombat}>
+                        Завершить бой
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {currentCombat.status === 'defeat' && (
+                  <div style={{ marginTop: '12px' }}>
+                    <h5>Поражение</h5>
+                    <p style={{ margin: '6px 0' }}>Потеря опыта: -{currentCombat.exp_lost || 0}</p>
+                    {currentCombat.death_territory && <p style={{ margin: '6px 0' }}>Территория: {currentCombat.death_territory}</p>}
+                    {(currentCombat.dropped_items || []).length > 0 && (
+                      <p style={{ margin: '6px 0' }}>
+                        Потеряно: {currentCombat.dropped_items.map((i) => `${i.name}x${i.quantity}`).join(', ')}
+                      </p>
+                    )}
+                    <button className="btn btn-success" onClick={finishCombat}>
+                      Завершить бой
+                    </button>
+                  </div>
+                )}
+
+                {currentCombat.status === 'fled' && (
+                  <div style={{ marginTop: '12px' }}>
+                    <button className="btn btn-success" onClick={finishCombat}>
+                      Завершить бой
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -2447,7 +3357,7 @@ function App() {
       <header className="header">
         <div className="header-content">
           <div className="logo">
-            <h1>Codex Online</h1>
+            <h1>CodeX of Honor</h1>
             <p>Live by the Codex. Die by the Sword.</p>
           </div>
           {token && userId ? (
@@ -2855,7 +3765,7 @@ function App() {
       </div>
 
       <footer className="footer">
-        <p>Codex Online 2026 • Made with ❤️ for all • MIT License</p>
+        <p>CodeX of Honor 2026 • Made with ❤️ for all • MIT License</p>
       </footer>
     </div>
   );

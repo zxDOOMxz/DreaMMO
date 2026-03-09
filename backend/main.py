@@ -11,6 +11,141 @@ from combat_routes import combat_router
 from party_routes import party_router
 from ability_routes import ability_router
 
+
+def _sync_incremental_hunting_content() -> None:
+    """Apply lightweight world sync for existing databases when heavy bootstrap is skipped."""
+    if (fetch_val("SELECT COUNT(*) FROM locations WHERE id = 1") or 0) == 0:
+        return
+
+    execute(
+        """
+        INSERT INTO mob_spawn_zones (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, position_z, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs)
+        SELECT 1, 'Подземелье: Канализация Ауриса', 'hunting', 185, 142, 118, -7, 26, 7, 10, TRUE, 180, 7
+        WHERE NOT EXISTS (SELECT 1 FROM mob_spawn_zones WHERE location_id = 1 AND zone_name = 'Подземелье: Канализация Ауриса')
+        """
+    )
+
+    # Ensure fox forest progression variants exist.
+    execute("""
+        INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+        SELECT 'Старый лис', 1, 26, 26, 3, 5, 1, 8, 2, 1, 'animal', 'passive', 90
+        WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Старый лис' AND location_id = 1)
+    """)
+    execute("""
+        INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+        SELECT 'Молодой лис', 2, 36, 36, 5, 8, 2, 16, 4, 1, 'animal', 'aggressive', 100
+        WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Молодой лис' AND location_id = 1)
+    """)
+    execute("""
+        INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+        SELECT 'Матерый лис', 3, 54, 54, 8, 12, 3, 26, 6, 1, 'animal', 'aggressive', 120
+        WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Матерый лис' AND location_id = 1)
+    """)
+    execute("""
+        INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+        SELECT 'Лисий вожак', 4, 88, 88, 13, 18, 5, 44, 12, 1, 'animal', 'aggressive', 180
+        WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Лисий вожак' AND location_id = 1)
+    """)
+
+    # Ensure sewer dungeon bandit roster exists.
+    execute("""
+        INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+        SELECT 'Канализационный карманник', 7, 132, 132, 18, 25, 7, 78, 18, 1, 'humanoid', 'aggressive', 180
+        WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Канализационный карманник' AND location_id = 1)
+    """)
+    execute("""
+        INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+        SELECT 'Канализационный налетчик', 8, 156, 156, 22, 30, 9, 98, 24, 1, 'humanoid', 'aggressive', 200
+        WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Канализационный налетчик' AND location_id = 1)
+    """)
+    execute("""
+        INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+        SELECT 'Канализационный головорез', 9, 182, 182, 26, 35, 10, 122, 30, 1, 'humanoid', 'aggressive', 230
+        WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Канализационный головорез' AND location_id = 1)
+    """)
+    execute("""
+        INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+        SELECT 'Канализационный вышибала', 9, 208, 208, 24, 38, 12, 132, 34, 1, 'humanoid', 'aggressive', 240
+        WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Канализационный вышибала' AND location_id = 1)
+    """)
+    execute("""
+        INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+        SELECT 'Главарь канализационной банды', 10, 320, 320, 34, 48, 15, 210, 55, 1, 'humanoid', 'aggressive', 420
+        WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Главарь канализационной банды' AND location_id = 1)
+    """)
+
+    # Fill legacy hunting zones in location 2 so every hunting zone has a spawn pool.
+    execute("""
+        INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+        SELECT 'Болотный гоблин', 4, 72, 72, 10, 15, 4, 34, 8, 2, 'humanoid', 'aggressive', 180
+        WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Болотный гоблин' AND location_id = 2)
+    """)
+
+    execute(
+        """
+        INSERT INTO mob_zone_spawns (spawn_zone_id, mob_id, spawn_chance, min_count, max_count, is_champion_spawn, champion_chance)
+        SELECT z.id, m.id, v.spawn_chance, v.min_count, v.max_count, v.is_champion_spawn, v.champion_chance
+        FROM (
+            VALUES
+                ('Зайчья поляна', 1, 'Кролик', 1.0, 5, 8, FALSE, 0.0),
+                ('Лисий лес', 1, 'Старый лис', 1.0, 2, 3, FALSE, 0.0),
+                ('Лисий лес', 1, 'Молодой лис', 0.85, 1, 2, TRUE, 0.06),
+                ('Лисий лес', 1, 'Матерый лис', 0.45, 1, 1, TRUE, 0.10),
+                ('Лисий лес', 1, 'Лисий вожак', 0.15, 1, 1, TRUE, 0.14),
+                ('Логово Волков', 1, 'Старый волк', 1.0, 2, 4, FALSE, 0.0),
+                ('Логово Волков', 1, 'Молодой волк', 0.85, 2, 3, TRUE, 0.06),
+                ('Логово Волков', 1, 'Матерый волк', 0.55, 1, 2, TRUE, 0.10),
+                ('Логово Волков', 1, 'Вожак волков', 0.20, 1, 1, TRUE, 0.15),
+                ('Подземелье: Канализация Ауриса', 1, 'Канализационный карманник', 1.0, 2, 3, FALSE, 0.0),
+                ('Подземелье: Канализация Ауриса', 1, 'Канализационный налетчик', 0.9, 2, 3, TRUE, 0.08),
+                ('Подземелье: Канализация Ауриса', 1, 'Канализационный головорез', 0.65, 1, 2, TRUE, 0.12),
+                ('Подземелье: Канализация Ауриса', 1, 'Канализационный вышибала', 0.55, 1, 2, TRUE, 0.12),
+                ('Подземелье: Канализация Ауриса', 1, 'Главарь канализационной банды', 0.20, 1, 1, TRUE, 0.20)
+                ,('Волчье логово', 2, 'Старый волк', 1.0, 2, 3, FALSE, 0.0)
+                ,('Волчье логово', 2, 'Молодой волк', 0.8, 1, 2, TRUE, 0.08)
+                ,('Волчье логово', 2, 'Матерый волк', 0.45, 1, 1, TRUE, 0.12)
+                ,('Лагерь гоблинов', 2, 'Болотный гоблин', 1.0, 2, 3, FALSE, 0.0)
+                ,('Лагерь гоблинов', 2, 'Огр', 0.3, 1, 1, TRUE, 0.10)
+        ) AS v(zone_name, location_id, mob_name, spawn_chance, min_count, max_count, is_champion_spawn, champion_chance)
+        JOIN mob_spawn_zones z ON z.zone_name = v.zone_name AND z.location_id = v.location_id
+        JOIN mobs m ON m.name = v.mob_name AND m.location_id = v.location_id
+        WHERE NOT EXISTS (
+            SELECT 1 FROM mob_zone_spawns s
+            WHERE s.spawn_zone_id = z.id AND s.mob_id = m.id
+        )
+        """
+    )
+
+    execute(
+        """
+        DELETE FROM mob_zone_spawns s
+        USING mob_spawn_zones z, mobs m
+        WHERE s.spawn_zone_id = z.id
+          AND s.mob_id = m.id
+          AND z.location_id = 1
+          AND z.zone_name = 'Лисий лес'
+          AND m.name NOT IN ('Старый лис', 'Молодой лис', 'Матерый лис', 'Лисий вожак')
+        """
+    )
+
+    execute(
+        """
+        DELETE FROM mob_zone_spawns s
+        USING mob_spawn_zones z, mobs m
+        WHERE s.spawn_zone_id = z.id
+          AND s.mob_id = m.id
+          AND z.location_id = 1
+          AND z.zone_name = 'Подземелье: Канализация Ауриса'
+          AND m.name NOT IN (
+              'Канализационный карманник',
+              'Канализационный налетчик',
+              'Канализационный головорез',
+              'Канализационный вышибала',
+              'Главарь канализационной банды'
+          )
+        """
+    )
+
 # === Жизненный цикл приложения ===
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -189,22 +324,79 @@ async def lifespan(app: FastAPI):
             """
         )
 
+        # Performance indexes for frequently used inventory/equipment queries.
+        execute("CREATE INDEX IF NOT EXISTS idx_inventory_char_equipped_slot ON inventory(character_id, equipped, slot)")
+        execute("CREATE INDEX IF NOT EXISTS idx_inventory_char_item_equipped_created ON inventory(character_id, item_id, equipped, created_at)")
+        execute("CREATE INDEX IF NOT EXISTS idx_inventory_char_item_slot ON inventory(character_id, item_id, slot)")
+
+        # Fast startup path: skip heavy legacy bootstrap when core data already exists.
+        seed_marker_path = Path(__file__).parent / ".startup_seed_done"
+        if seed_marker_path.exists():
+            _sync_incremental_hunting_content()
+            print("[INFO] Heavy startup bootstrap skipped (marker file found).")
+            print(f"[STARTED] {settings.APP_NAME} v{settings.APP_VERSION} запущен!")
+            yield
+            await close_db_pool()
+            print("[STOPPED] Приложение остановлено")
+            return
+
+        has_locations = (fetch_val("SELECT COUNT(*) FROM locations") or 0) > 0
+        has_races = (fetch_val("SELECT COUNT(*) FROM races") or 0) > 0
+        has_classes = (fetch_val("SELECT COUNT(*) FROM character_classes") or 0) > 0
+        if has_locations and has_races and has_classes:
+            _sync_incremental_hunting_content()
+            seed_marker_path.touch(exist_ok=True)
+            print("[INFO] Heavy startup bootstrap skipped (database already initialized).")
+            print(f"[STARTED] {settings.APP_NAME} v{settings.APP_VERSION} запущен!")
+            yield
+            await close_db_pool()
+            print("[STOPPED] Приложение остановлено")
+            return
+
         # Testing economy bootstrap: every character has at least 100 gold and 100 silver.
         execute("UPDATE characters SET gold = GREATEST(COALESCE(gold, 0), 100), silver = GREATEST(COALESCE(silver, 0), 100)")
         
         # Add test data
-        from database.connection import fetch_val
         loc_count = fetch_val("SELECT COUNT(*) FROM locations")
         if loc_count == 0:
             execute("""
                 INSERT INTO locations (name, description, location_type, danger_level) VALUES 
-                ('Элдория', 'Главная деревня - место начала приключений. Здесь находятся торговцы, квестодатели и все необходимое для выживания', 'city', 1),
-                ('Лес Охотников', 'Безопасный лес рядом с деревней, идеален для новичков', 'forest', 1),
-                ('Горные пещеры', 'Пещеры в горах где можно добывать руду и камни', 'cave', 2),
-                ('Болотистые земли', 'Опасное болото с агрессивными существами', 'swamp', 3),
-                ('Темный лес', 'Очень опасный лес с сильными врагами', 'forest', 4),
-                ('Горы Дракона', 'Высокие горы с древними руинами и боссами', 'mountain', 5)
+                ('Изумрудные леса Лирана', 'Стартовая карта Элдории для новичков 1-10 уровня. Здесь находится город Аурис, зоны охоты и добычи.', 'forest', 1),
+                ('Туманные болота Моргрима', 'Нейтральная карта 10-15 уровня с повышенной опасностью и редкими ресурсами.', 'swamp', 2),
+                ('Пепельные земли Кхаргара', 'ПВП-карта 15-20 уровня с высокой угрозой и конфликтными точками контроля.', 'wasteland', 4)
             """)
+
+        # Keep the three canonical world maps in sync for existing databases.
+        execute(
+            """
+            UPDATE locations
+            SET name = 'Изумрудные леса Лирана',
+                description = 'Стартовая карта Элдории для новичков 1-10 уровня. Здесь находится город Аурис, зоны охоты и добычи.',
+                location_type = 'forest',
+                danger_level = 1
+            WHERE id = 1
+            """
+        )
+        execute(
+            """
+            UPDATE locations
+            SET name = 'Туманные болота Моргрима',
+                description = 'Нейтральная карта 10-15 уровня с повышенной опасностью и редкими ресурсами.',
+                location_type = 'swamp',
+                danger_level = 2
+            WHERE id = 2
+            """
+        )
+        execute(
+            """
+            UPDATE locations
+            SET name = 'Пепельные земли Кхаргара',
+                description = 'ПВП-карта 15-20 уровня с высокой угрозой и конфликтными точками контроля.',
+                location_type = 'wasteland',
+                danger_level = 4
+            WHERE id = 3
+            """
+        )
         
         # Add races with passive abilities
         # Ensure races exist and are correct (use UPSERT to handle existing data)
@@ -349,45 +541,100 @@ async def lifespan(app: FastAPI):
               AND z1.zone_name = z2.zone_name
         """)
 
-        # Normalize zone ownership and coordinates (city vs hunting/gathering) for legacy DBs.
+        # Normalize novice-world zones for Элдория (single world with city/hunting/resource areas).
         execute("""
             UPDATE mob_spawn_zones
             SET location_id = 1
-            WHERE zone_name IN ('Рыночная площадь', 'Корчма "Золотой кубок"', 'Лавка ремесленника', 'Оружейная мастерская', 'Палатка алхимика', 'Крафтовый квартал')
+            WHERE zone_name IN (
+                'Рыночная площадь', 'Корчма "Золотой кубок"', 'Лавка ремесленника', 'Оружейная мастерская', 'Палатка алхимика', 'Крафтовый квартал',
+                'Город новичков Аурис', 'Площадь Рассвета', 'Квартал ремесленников Ауриса', 'Кузница Ауриса', 'Алхимическая лавка Ауриса', 'Ремесленные мастерские Ауриса'
+            )
         """)
         execute("""
             UPDATE mob_spawn_zones
-            SET location_id = 2
-            WHERE zone_name IN ('Поляна с кроликами', 'Логово лис', 'Волчий лес', 'Лагерь гоблинов', 'Стая волков')
+            SET location_id = 1
+            WHERE zone_name IN ('Поляна с кроликами', 'Зайчья поляна', 'Логово лис', 'Лисий лес', 'Волчий лес', 'Логово Волков', 'Стая волков')
         """)
         execute("""
             UPDATE mob_spawn_zones
-            SET location_id = 3
-            WHERE zone_name IN ('Железные жилы', 'Медные залежи', 'Пещерный лес', 'Кристальные образования')
+            SET location_id = 1
+            WHERE zone_name IN ('Железные жилы', 'Железный рудник', 'Медные залежи', 'Каменный карьер', 'Пещерный лес', 'Лес Лесорубов', 'Кристальные образования')
         """)
 
-        execute("UPDATE mob_spawn_zones SET position_x = 0, position_y = 0, distance_from_center = 0 WHERE location_id = 1 AND zone_name = 'Рыночная площадь'")
-        execute("UPDATE mob_spawn_zones SET position_x = 10, position_y = 5, distance_from_center = 11 WHERE location_id = 1 AND zone_name = 'Корчма \"Золотой кубок\"'")
-        execute("UPDATE mob_spawn_zones SET position_x = 15, position_y = 10, distance_from_center = 18 WHERE location_id = 1 AND zone_name = 'Лавка ремесленника'")
-        execute("UPDATE mob_spawn_zones SET position_x = 20, position_y = 15, distance_from_center = 25 WHERE location_id = 1 AND zone_name = 'Оружейная мастерская'")
-        execute("UPDATE mob_spawn_zones SET position_x = 25, position_y = 20, distance_from_center = 32 WHERE location_id = 1 AND zone_name = 'Палатка алхимика'")
-        execute("UPDATE mob_spawn_zones SET position_x = 30, position_y = 15, distance_from_center = 34 WHERE location_id = 1 AND zone_name = 'Крафтовый квартал'")
+        execute("""
+            UPDATE mob_spawn_zones
+            SET zone_name = CASE
+                WHEN zone_name = 'Рыночная площадь' THEN 'Город новичков Аурис'
+                WHEN zone_name = 'Корчма "Золотой кубок"' THEN 'Площадь Рассвета'
+                WHEN zone_name = 'Лавка ремесленника' THEN 'Квартал ремесленников Ауриса'
+                WHEN zone_name = 'Оружейная мастерская' THEN 'Кузница Ауриса'
+                WHEN zone_name = 'Палатка алхимика' THEN 'Алхимическая лавка Ауриса'
+                WHEN zone_name = 'Крафтовый квартал' THEN 'Ремесленные мастерские Ауриса'
+                WHEN zone_name = 'Поляна с кроликами' THEN 'Зайчья поляна'
+                WHEN zone_name = 'Логово лис' THEN 'Лисий лес'
+                WHEN zone_name IN ('Волчий лес', 'Стая волков') THEN 'Логово Волков'
+                WHEN zone_name = 'Железные жилы' THEN 'Железный рудник'
+                WHEN zone_name = 'Медные залежи' THEN 'Каменный карьер'
+                WHEN zone_name IN ('Пещерный лес', 'Кристальные образования') THEN 'Лес Лесорубов'
+                ELSE zone_name
+            END
+            WHERE zone_name IN (
+                'Рыночная площадь', 'Корчма "Золотой кубок"', 'Лавка ремесленника', 'Оружейная мастерская', 'Палатка алхимика', 'Крафтовый квартал',
+                'Поляна с кроликами', 'Логово лис', 'Волчий лес', 'Стая волков',
+                'Железные жилы', 'Медные залежи', 'Пещерный лес', 'Кристальные образования'
+            )
+        """)
 
-        execute("UPDATE mob_spawn_zones SET position_x = 30, position_y = 30, distance_from_center = 42 WHERE location_id = 2 AND zone_name = 'Поляна с кроликами'")
-        execute("UPDATE mob_spawn_zones SET position_x = 60, position_y = 40, distance_from_center = 72 WHERE location_id = 2 AND zone_name = 'Логово лис'")
-        execute("UPDATE mob_spawn_zones SET position_x = 100, position_y = 70, distance_from_center = 122 WHERE location_id = 2 AND zone_name IN ('Волчий лес', 'Стая волков')")
-        execute("UPDATE mob_spawn_zones SET position_x = 140, position_y = 90, distance_from_center = 166 WHERE location_id = 2 AND zone_name = 'Лагерь гоблинов'")
+        execute("UPDATE mob_spawn_zones SET position_x = 0, position_y = 0, distance_from_center = 0 WHERE location_id = 1 AND zone_name = 'Город новичков Аурис'")
+        execute("UPDATE mob_spawn_zones SET position_x = 8, position_y = 6, distance_from_center = 10 WHERE location_id = 1 AND zone_name = 'Площадь Рассвета'")
+        execute("UPDATE mob_spawn_zones SET position_x = 16, position_y = 11, distance_from_center = 19 WHERE location_id = 1 AND zone_name = 'Квартал ремесленников Ауриса'")
+        execute("UPDATE mob_spawn_zones SET position_x = 22, position_y = 14, distance_from_center = 26 WHERE location_id = 1 AND zone_name = 'Кузница Ауриса'")
+        execute("UPDATE mob_spawn_zones SET position_x = 27, position_y = 19, distance_from_center = 33 WHERE location_id = 1 AND zone_name = 'Алхимическая лавка Ауриса'")
+        execute("UPDATE mob_spawn_zones SET position_x = 33, position_y = 14, distance_from_center = 36 WHERE location_id = 1 AND zone_name = 'Ремесленные мастерские Ауриса'")
+
+        execute("UPDATE mob_spawn_zones SET position_x = 35, position_y = 30, distance_from_center = 46 WHERE location_id = 1 AND zone_name = 'Зайчья поляна'")
+        execute("UPDATE mob_spawn_zones SET position_x = 70, position_y = 45, distance_from_center = 83 WHERE location_id = 1 AND zone_name = 'Лисий лес'")
+        execute("UPDATE mob_spawn_zones SET position_x = 115, position_y = 75, distance_from_center = 137 WHERE location_id = 1 AND zone_name = 'Логово Волков'")
+        execute("UPDATE mob_spawn_zones SET position_x = 142, position_y = 118, position_z = -7, distance_from_center = 185 WHERE location_id = 1 AND zone_name = 'Подземелье: Канализация Ауриса'")
+        execute("UPDATE mob_spawn_zones SET position_x = 45, position_y = -30, distance_from_center = 54 WHERE location_id = 1 AND zone_name = 'Железный рудник'")
+        execute("UPDATE mob_spawn_zones SET position_x = 78, position_y = -38, distance_from_center = 87 WHERE location_id = 1 AND zone_name = 'Каменный карьер'")
+        execute("UPDATE mob_spawn_zones SET position_x = 102, position_y = -18, distance_from_center = 104 WHERE location_id = 1 AND zone_name = 'Лес Лесорубов'")
         execute("UPDATE mob_spawn_zones SET position_z = COALESCE(position_z, 0)")
+
+        # Remove duplicates that can appear after legacy rename operations.
+        execute(
+            """
+            DELETE FROM mob_spawn_zones z1
+            USING mob_spawn_zones z2
+            WHERE z1.id > z2.id
+              AND z1.location_id = z2.location_id
+              AND z1.zone_name = z2.zone_name
+            """
+        )
+
+        # Keep only canonical novice-map zones inside Изумрудные леса Лирана (location_id=1).
+        execute(
+            """
+            DELETE FROM mob_spawn_zones
+            WHERE location_id = 1
+              AND zone_type IN ('city', 'hunting', 'resource')
+              AND zone_name NOT IN (
+                  'Город новичков Аурис', 'Площадь Рассвета', 'Квартал ремесленников Ауриса',
+                  'Кузница Ауриса', 'Алхимическая лавка Ауриса', 'Ремесленные мастерские Ауриса',
+                                    'Зайчья поляна', 'Лисий лес', 'Логово Волков', 'Подземелье: Канализация Ауриса',
+                  'Железный рудник', 'Каменный карьер', 'Лес Лесорубов'
+              )
+            """
+        )
 
         # Strict zone taxonomy: only city, hunting, resource.
         execute(
             """
             UPDATE mob_spawn_zones
             SET zone_type = CASE
+                WHEN zone_name IN ('Зайчья поляна', 'Лисий лес', 'Логово Волков', 'Подземелье: Канализация Ауриса') THEN 'hunting'
+                WHEN zone_name IN ('Железный рудник', 'Каменный карьер', 'Лес Лесорубов') THEN 'resource'
                 WHEN location_id = 1 THEN 'city'
-                WHEN zone_name IN ('Лесная деревня', 'Шахтерский поселок') THEN 'city'
-                WHEN location_id = 2 THEN 'hunting'
-                WHEN location_id = 3 THEN 'resource'
                 ELSE zone_type
             END
             WHERE location_id IN (1, 2, 3)
@@ -816,85 +1063,180 @@ async def lifespan(app: FastAPI):
                 ('Кролик', 1, 20, 20, 2, 4, 0, 5, 1, 1, 'animal', 'passive', 60),
                 ('Волк', 2, 35, 35, 5, 8, 2, 15, 3, 1, 'animal', 'aggressive', 120),
                 ('Гоблин', 3, 50, 50, 7, 12, 3, 25, 5, 1, 'humanoid', 'aggressive', 180),
-                ('Лесной волк', 2, 40, 40, 6, 9, 1, 18, 4, 2, 'animal', 'aggressive', 120),
-                ('Огр', 3, 80, 80, 10, 15, 5, 35, 8, 2, 'giant', 'aggressive', 300),
+                ('Лесной волк', 2, 40, 40, 6, 9, 1, 18, 4, 1, 'animal', 'aggressive', 120),
+                ('Огр', 3, 80, 80, 10, 15, 5, 35, 8, 1, 'giant', 'aggressive', 300),
                 ('Лис', 1, 25, 25, 3, 5, 1, 8, 2, 1, 'animal', 'passive', 90)
             """)
 
         # Wolf progression variants for hunting content.
         execute("""
             INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
-            SELECT 'Старый волк', 2, 32, 32, 4, 7, 1, 12, 2, 2, 'animal', 'aggressive', 120
-            WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Старый волк' AND location_id = 2)
+            SELECT 'Старый волк', 2, 32, 32, 4, 7, 1, 12, 2, 1, 'animal', 'aggressive', 120
+            WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Старый волк' AND location_id = 1)
         """)
         execute("""
             INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
-            SELECT 'Молодой волк', 3, 48, 48, 7, 11, 2, 20, 4, 2, 'animal', 'aggressive', 130
-            WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Молодой волк' AND location_id = 2)
+            SELECT 'Молодой волк', 3, 48, 48, 7, 11, 2, 20, 4, 1, 'animal', 'aggressive', 130
+            WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Молодой волк' AND location_id = 1)
         """)
         execute("""
             INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
-            SELECT 'Матерый волк', 5, 88, 88, 13, 19, 5, 42, 10, 2, 'animal', 'aggressive', 180
-            WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Матерый волк' AND location_id = 2)
+            SELECT 'Матерый волк', 5, 88, 88, 13, 19, 5, 42, 10, 1, 'animal', 'aggressive', 180
+            WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Матерый волк' AND location_id = 1)
         """)
         execute("""
             INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
-            SELECT 'Вожак волков', 8, 180, 180, 22, 34, 10, 110, 30, 2, 'animal', 'aggressive', 360
-            WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Вожак волков' AND location_id = 2)
+            SELECT 'Вожак волков', 8, 180, 180, 22, 34, 10, 110, 30, 1, 'animal', 'aggressive', 360
+            WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Вожак волков' AND location_id = 1)
+        """)
+
+        # Fox progression variants for fox forest.
+        execute("""
+            INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+            SELECT 'Старый лис', 1, 26, 26, 3, 5, 1, 8, 2, 1, 'animal', 'passive', 90
+            WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Старый лис' AND location_id = 1)
+        """)
+        execute("""
+            INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+            SELECT 'Молодой лис', 2, 36, 36, 5, 8, 2, 16, 4, 1, 'animal', 'aggressive', 100
+            WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Молодой лис' AND location_id = 1)
+        """)
+        execute("""
+            INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+            SELECT 'Матерый лис', 3, 54, 54, 8, 12, 3, 26, 6, 1, 'animal', 'aggressive', 120
+            WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Матерый лис' AND location_id = 1)
+        """)
+        execute("""
+            INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+            SELECT 'Лисий вожак', 4, 88, 88, 13, 18, 5, 44, 12, 1, 'animal', 'aggressive', 180
+            WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Лисий вожак' AND location_id = 1)
+        """)
+
+        # Sewer dungeon bandits (lvl 7-10, boss included).
+        execute("""
+            INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+            SELECT 'Канализационный карманник', 7, 132, 132, 18, 25, 7, 78, 18, 1, 'humanoid', 'aggressive', 180
+            WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Канализационный карманник' AND location_id = 1)
+        """)
+        execute("""
+            INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+            SELECT 'Канализационный налетчик', 8, 156, 156, 22, 30, 9, 98, 24, 1, 'humanoid', 'aggressive', 200
+            WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Канализационный налетчик' AND location_id = 1)
+        """)
+        execute("""
+            INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+            SELECT 'Канализационный головорез', 9, 182, 182, 26, 35, 10, 122, 30, 1, 'humanoid', 'aggressive', 230
+            WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Канализационный головорез' AND location_id = 1)
+        """)
+        execute("""
+            INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+            SELECT 'Канализационный вышибала', 9, 208, 208, 24, 38, 12, 132, 34, 1, 'humanoid', 'aggressive', 240
+            WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Канализационный вышибала' AND location_id = 1)
+        """)
+        execute("""
+            INSERT INTO mobs (name, level, health_points, max_health_points, damage_min, damage_max, armor_class, experience_reward, gold_reward, location_id, mob_type, aggression_type, respawn_time)
+            SELECT 'Главарь канализационной банды', 10, 320, 320, 34, 48, 15, 210, 55, 1, 'humanoid', 'aggressive', 420
+            WHERE NOT EXISTS (SELECT 1 FROM mobs WHERE name = 'Главарь канализационной банды' AND location_id = 1)
         """)
         
         # Create mob spawn zones (EVE Online style with distances)
-        spawn_zone_count = fetch_val("SELECT COUNT(*) FROM mob_spawn_zones WHERE location_id IN (1,2,3)")
+        spawn_zone_count = fetch_val("SELECT COUNT(*) FROM mob_spawn_zones WHERE location_id = 1")
         if spawn_zone_count < 8:
             execute("""
                 INSERT INTO mob_spawn_zones (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, position_z, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs) VALUES 
                 -- City zones (Элдория - location 1)
-                (1, 'Рыночная площадь', 'city', 0, 0, 0, 0, 30, 1, 1, FALSE, 0, 0),
-                (1, 'Корчма "Золотой кубок"', 'city', 10, 10, 5, 0, 20, 1, 1, FALSE, 0, 0),
-                (1, 'Лавка ремесленника', 'city', 15, 15, 10, 0, 20, 1, 1, FALSE, 0, 0),
-                (1, 'Оружейная мастерская', 'city', 20, 5, 15, 0, 20, 1, 1, FALSE, 0, 0),
-                (1, 'Палатка алхимика', 'city', 25, 20, 20, 0, 20, 1, 1, FALSE, 0, 0),
-                (1, 'Крафтовый квартал', 'city', 35, 30, 15, 0, 24, 1, 2, FALSE, 0, 0),
+                (1, 'Город новичков Аурис', 'city', 0, 0, 0, 0, 32, 1, 2, FALSE, 0, 0),
+                (1, 'Площадь Рассвета', 'city', 10, 8, 6, 0, 22, 1, 2, FALSE, 0, 0),
+                (1, 'Квартал ремесленников Ауриса', 'city', 19, 16, 11, 0, 22, 1, 3, FALSE, 0, 0),
+                (1, 'Кузница Ауриса', 'city', 26, 22, 14, 0, 20, 1, 3, FALSE, 0, 0),
+                (1, 'Алхимическая лавка Ауриса', 'city', 33, 27, 19, 0, 20, 1, 3, FALSE, 0, 0),
+                (1, 'Ремесленные мастерские Ауриса', 'city', 36, 33, 14, 0, 24, 1, 4, FALSE, 0, 0),
                 
-                -- Hunting zones near city (Лес Охотников - location 2)
-                (2, 'Лесная деревня', 'city', 20, 18, 12, 0, 22, 1, 2, FALSE, 0, 0),
-                (2, 'Поляна с кроликами', 'hunting', 30, 30, 30, 0, 20, 1, 1, FALSE, 60, 8),
-                (2, 'Логово лис', 'hunting', 75, 75, 50, 0, 25, 1, 2, FALSE, 90, 6),
-                (2, 'Волчий лес', 'hunting', 150, 100, 100, 0, 30, 2, 8, TRUE, 120, 5),
-                (2, 'Лагерь гоблинов', 'hunting', 200, 150, 80, 0, 40, 3, 4, TRUE, 180, 8),
+                -- Hunting zones inside Элдория
+                (1, 'Зайчья поляна', 'hunting', 46, 35, 30, 0, 20, 1, 1, FALSE, 60, 8),
+                (1, 'Лисий лес', 'hunting', 83, 70, 45, 0, 25, 1, 2, FALSE, 90, 6),
+                (1, 'Логово Волков', 'hunting', 137, 115, 75, 0, 30, 2, 8, TRUE, 120, 5),
+                (1, 'Подземелье: Канализация Ауриса', 'hunting', 185, 142, 118, -7, 26, 7, 10, TRUE, 180, 7),
                 
-                -- Gathering zones (Горные пещеры - location 3)
-                (3, 'Шахтерский поселок', 'city', 25, 20, 18, 0, 24, 1, 2, FALSE, 0, 0),
-                (3, 'Железные жилы', 'resource', 50, 50, 50, 0, 30, 1, 2, FALSE, 0, 0),
-                (3, 'Медные залежи', 'resource', 80, 100, 70, 0, 25, 1, 1, FALSE, 0, 0),
-                (3, 'Пещерный лес', 'resource', 100, 30, 100, 0, 40, 2, 3, TRUE, 120, 6),
-                (3, 'Кристальные образования', 'resource', 150, 150, 150, 0, 35, 3, 4, TRUE, 180, 4)
+                -- Resource zones inside Элдория
+                (1, 'Железный рудник', 'resource', 54, 45, -30, 0, 30, 1, 2, FALSE, 0, 0),
+                (1, 'Каменный карьер', 'resource', 87, 78, -38, 0, 25, 1, 2, FALSE, 0, 0),
+                (1, 'Лес Лесорубов', 'resource', 104, 102, -18, 0, 35, 1, 3, FALSE, 0, 0)
             """)
 
-        if (fetch_val("SELECT COUNT(*) FROM mob_spawn_zones WHERE location_id = 2 AND zone_name = 'Лесная деревня'") or 0) == 0:
-            execute(
-                """
-                INSERT INTO mob_spawn_zones
-                    (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, position_z, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs)
-                VALUES (2, 'Лесная деревня', 'city', 20, 18, 12, 0, 22, 1, 2, FALSE, 0, 0)
-                """
-            )
-
-        if (fetch_val("SELECT COUNT(*) FROM mob_spawn_zones WHERE location_id = 3 AND zone_name = 'Шахтерский поселок'") or 0) == 0:
-            execute(
-                """
-                INSERT INTO mob_spawn_zones
-                    (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, position_z, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs)
-                VALUES (3, 'Шахтерский поселок', 'city', 25, 20, 18, 0, 24, 1, 2, FALSE, 0, 0)
-                """
-            )
+        # Ensure every canonical zone exists even on partially migrated databases.
+        execute("""
+            INSERT INTO mob_spawn_zones (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, position_z, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs)
+            SELECT 1, 'Город новичков Аурис', 'city', 0, 0, 0, 0, 32, 1, 2, FALSE, 0, 0
+            WHERE NOT EXISTS (SELECT 1 FROM mob_spawn_zones WHERE location_id = 1 AND zone_name = 'Город новичков Аурис')
+        """)
+        execute("""
+            INSERT INTO mob_spawn_zones (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, position_z, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs)
+            SELECT 1, 'Площадь Рассвета', 'city', 10, 8, 6, 0, 22, 1, 2, FALSE, 0, 0
+            WHERE NOT EXISTS (SELECT 1 FROM mob_spawn_zones WHERE location_id = 1 AND zone_name = 'Площадь Рассвета')
+        """)
+        execute("""
+            INSERT INTO mob_spawn_zones (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, position_z, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs)
+            SELECT 1, 'Квартал ремесленников Ауриса', 'city', 19, 16, 11, 0, 22, 1, 3, FALSE, 0, 0
+            WHERE NOT EXISTS (SELECT 1 FROM mob_spawn_zones WHERE location_id = 1 AND zone_name = 'Квартал ремесленников Ауриса')
+        """)
+        execute("""
+            INSERT INTO mob_spawn_zones (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, position_z, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs)
+            SELECT 1, 'Кузница Ауриса', 'city', 26, 22, 14, 0, 20, 1, 3, FALSE, 0, 0
+            WHERE NOT EXISTS (SELECT 1 FROM mob_spawn_zones WHERE location_id = 1 AND zone_name = 'Кузница Ауриса')
+        """)
+        execute("""
+            INSERT INTO mob_spawn_zones (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, position_z, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs)
+            SELECT 1, 'Алхимическая лавка Ауриса', 'city', 33, 27, 19, 0, 20, 1, 3, FALSE, 0, 0
+            WHERE NOT EXISTS (SELECT 1 FROM mob_spawn_zones WHERE location_id = 1 AND zone_name = 'Алхимическая лавка Ауриса')
+        """)
+        execute("""
+            INSERT INTO mob_spawn_zones (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, position_z, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs)
+            SELECT 1, 'Ремесленные мастерские Ауриса', 'city', 36, 33, 14, 0, 24, 1, 4, FALSE, 0, 0
+            WHERE NOT EXISTS (SELECT 1 FROM mob_spawn_zones WHERE location_id = 1 AND zone_name = 'Ремесленные мастерские Ауриса')
+        """)
+        execute("""
+            INSERT INTO mob_spawn_zones (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, position_z, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs)
+            SELECT 1, 'Зайчья поляна', 'hunting', 46, 35, 30, 0, 20, 1, 1, FALSE, 60, 8
+            WHERE NOT EXISTS (SELECT 1 FROM mob_spawn_zones WHERE location_id = 1 AND zone_name = 'Зайчья поляна')
+        """)
+        execute("""
+            INSERT INTO mob_spawn_zones (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, position_z, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs)
+            SELECT 1, 'Лисий лес', 'hunting', 83, 70, 45, 0, 25, 1, 2, FALSE, 90, 6
+            WHERE NOT EXISTS (SELECT 1 FROM mob_spawn_zones WHERE location_id = 1 AND zone_name = 'Лисий лес')
+        """)
+        execute("""
+            INSERT INTO mob_spawn_zones (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, position_z, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs)
+            SELECT 1, 'Логово Волков', 'hunting', 137, 115, 75, 0, 30, 2, 8, TRUE, 120, 5
+            WHERE NOT EXISTS (SELECT 1 FROM mob_spawn_zones WHERE location_id = 1 AND zone_name = 'Логово Волков')
+        """)
+        execute("""
+            INSERT INTO mob_spawn_zones (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, position_z, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs)
+            SELECT 1, 'Подземелье: Канализация Ауриса', 'hunting', 185, 142, 118, -7, 26, 7, 10, TRUE, 180, 7
+            WHERE NOT EXISTS (SELECT 1 FROM mob_spawn_zones WHERE location_id = 1 AND zone_name = 'Подземелье: Канализация Ауриса')
+        """)
+        execute("""
+            INSERT INTO mob_spawn_zones (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, position_z, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs)
+            SELECT 1, 'Железный рудник', 'resource', 54, 45, -30, 0, 30, 1, 2, FALSE, 0, 0
+            WHERE NOT EXISTS (SELECT 1 FROM mob_spawn_zones WHERE location_id = 1 AND zone_name = 'Железный рудник')
+        """)
+        execute("""
+            INSERT INTO mob_spawn_zones (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, position_z, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs)
+            SELECT 1, 'Каменный карьер', 'resource', 87, 78, -38, 0, 25, 1, 2, FALSE, 0, 0
+            WHERE NOT EXISTS (SELECT 1 FROM mob_spawn_zones WHERE location_id = 1 AND zone_name = 'Каменный карьер')
+        """)
+        execute("""
+            INSERT INTO mob_spawn_zones (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, position_z, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs)
+            SELECT 1, 'Лес Лесорубов', 'resource', 104, 102, -18, 0, 35, 1, 3, FALSE, 0, 0
+            WHERE NOT EXISTS (SELECT 1 FROM mob_spawn_zones WHERE location_id = 1 AND zone_name = 'Лес Лесорубов')
+        """)
 
         # Ensure crafting district exists for older databases.
-        if (fetch_val("SELECT COUNT(*) FROM mob_spawn_zones WHERE location_id = 1 AND zone_name = 'Крафтовый квартал'") or 0) == 0:
+        if (fetch_val("SELECT COUNT(*) FROM mob_spawn_zones WHERE location_id = 1 AND zone_name = 'Ремесленные мастерские Ауриса'") or 0) == 0:
             execute("""
                 INSERT INTO mob_spawn_zones
                     (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, position_z, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs)
-                VALUES (1, 'Крафтовый квартал', 'city', 35, 30, 15, 0, 24, 1, 2, FALSE, 0, 0)
+                VALUES (1, 'Ремесленные мастерские Ауриса', 'city', 36, 33, 14, 0, 24, 1, 4, FALSE, 0, 0)
             """)
             
             # Link mobs to spawn zones (safe join: only existing mobs/zones are inserted)
@@ -903,11 +1245,10 @@ async def lifespan(app: FastAPI):
                 SELECT z.id, m.id, v.spawn_chance, v.min_count, v.max_count, v.is_champion_spawn, v.champion_chance
                 FROM (
                     VALUES
-                        ('Поляна с кроликами', 2, 'Кролик', 1.0, 5, 8, FALSE, 0.0),
-                        ('Логово лис', 2, 'Лис', 1.0, 3, 5, TRUE, 0.08),
-                        ('Волчий лес', 2, 'Лесной волк', 1.0, 2, 4, TRUE, 0.12),
-                        ('Лагерь гоблинов', 2, 'Гоблин', 1.0, 4, 7, TRUE, 0.15),
-                        ('Пещерный лес', 3, 'Огр', 1.0, 2, 4, TRUE, 0.20)
+                        ('Зайчья поляна', 1, 'Кролик', 1.0, 5, 8, FALSE, 0.0),
+                        ('Лисий лес', 1, 'Лис', 1.0, 3, 5, TRUE, 0.08),
+                        ('Логово Волков', 1, 'Лесной волк', 1.0, 2, 4, TRUE, 0.12),
+                        ('Логово Волков', 1, 'Волк', 0.7, 1, 3, FALSE, 0.0)
                 ) AS v(zone_name, location_id, mob_name, spawn_chance, min_count, max_count, is_champion_spawn, champion_chance)
                 JOIN mob_spawn_zones z ON z.zone_name = v.zone_name AND z.location_id = v.location_id
                 JOIN mobs m ON m.name = v.mob_name
@@ -917,19 +1258,36 @@ async def lifespan(app: FastAPI):
                 )
             """)
 
-        # Fallback for old databases: guarantee at least starter zones in city and hunting area
+        # Fallback for old databases: guarantee at least starter zones in Элдория.
         if fetch_val("SELECT COUNT(*) FROM mob_spawn_zones WHERE location_id = 1") == 0:
             execute("""
                 INSERT INTO mob_spawn_zones (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs) VALUES
-                (1, 'Рыночная площадь', 'city', 0, 0, 0, 30, 1, 1, FALSE, 0, 0),
-                (1, 'Корчма "Золотой кубок"', 'city', 10, 10, 5, 20, 1, 1, FALSE, 0, 0)
+                (1, 'Город новичков Аурис', 'city', 0, 0, 0, 32, 1, 2, FALSE, 0, 0),
+                (1, 'Площадь Рассвета', 'city', 10, 8, 6, 22, 1, 2, FALSE, 0, 0),
+                (1, 'Зайчья поляна', 'hunting', 46, 35, 30, 20, 1, 1, FALSE, 60, 8),
+                (1, 'Лисий лес', 'hunting', 83, 70, 45, 25, 1, 2, FALSE, 90, 6),
+                (1, 'Логово Волков', 'hunting', 137, 115, 75, 30, 2, 8, TRUE, 120, 5),
+                (1, 'Подземелье: Канализация Ауриса', 'hunting', 185, 142, 118, 26, 7, 10, TRUE, 180, 7),
+                (1, 'Железный рудник', 'resource', 54, 45, -30, 25, 1, 2, FALSE, 0, 0),
+                (1, 'Каменный карьер', 'resource', 87, 78, -38, 25, 1, 2, FALSE, 0, 0),
+                (1, 'Лес Лесорубов', 'resource', 104, 102, -18, 25, 1, 3, FALSE, 0, 0)
             """)
 
-        if fetch_val("SELECT COUNT(*) FROM mob_spawn_zones WHERE location_id = 2") == 0:
+        if fetch_val("SELECT COUNT(*) FROM mob_spawn_zones WHERE location_id = 1 AND zone_type = 'hunting'") == 0:
             execute("""
                 INSERT INTO mob_spawn_zones (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs) VALUES
-                (2, 'Поляна с кроликами', 'hunting', 30, 30, 30, 20, 1, 1, FALSE, 60, 8),
-                (2, 'Логово лис', 'hunting', 75, 75, 50, 25, 1, 2, FALSE, 90, 6)
+                (1, 'Зайчья поляна', 'hunting', 46, 35, 30, 20, 1, 1, FALSE, 60, 8),
+                (1, 'Лисий лес', 'hunting', 83, 70, 45, 25, 1, 2, FALSE, 90, 6),
+                (1, 'Логово Волков', 'hunting', 137, 115, 75, 30, 2, 8, TRUE, 120, 5),
+                (1, 'Подземелье: Канализация Ауриса', 'hunting', 185, 142, 118, 26, 7, 10, TRUE, 180, 7)
+            """)
+
+        if fetch_val("SELECT COUNT(*) FROM mob_spawn_zones WHERE location_id = 1 AND zone_type = 'resource'") == 0:
+            execute("""
+                INSERT INTO mob_spawn_zones (location_id, zone_name, zone_type, distance_from_center, position_x, position_y, radius, min_level, max_level, is_aggressive_zone, respawn_timer, max_mobs) VALUES
+                (1, 'Железный рудник', 'resource', 54, 45, -30, 25, 1, 2, FALSE, 0, 0),
+                (1, 'Каменный карьер', 'resource', 87, 78, -38, 25, 1, 2, FALSE, 0, 0),
+                (1, 'Лес Лесорубов', 'resource', 104, 102, -18, 25, 1, 3, FALSE, 0, 0)
             """)
 
         execute(
@@ -938,14 +1296,20 @@ async def lifespan(app: FastAPI):
             SELECT z.id, m.id, v.spawn_chance, v.min_count, v.max_count, v.is_champion_spawn, v.champion_chance
             FROM (
                 VALUES
-                    ('Поляна с кроликами', 2, 'Кролик', 1.0, 5, 8, FALSE, 0.0),
-                    ('Логово лис', 2, 'Лис', 1.0, 3, 5, TRUE, 0.08),
-                    ('Волчий лес', 2, 'Старый волк', 1.0, 2, 4, FALSE, 0.0),
-                    ('Волчий лес', 2, 'Молодой волк', 0.85, 2, 3, TRUE, 0.06),
-                    ('Волчий лес', 2, 'Матерый волк', 0.55, 1, 2, TRUE, 0.10),
-                    ('Волчий лес', 2, 'Вожак волков', 0.20, 1, 1, TRUE, 0.15),
-                    ('Лагерь гоблинов', 2, 'Гоблин', 1.0, 4, 7, TRUE, 0.15),
-                    ('Пещерный лес', 3, 'Огр', 1.0, 2, 4, TRUE, 0.20)
+                    ('Зайчья поляна', 1, 'Кролик', 1.0, 5, 8, FALSE, 0.0),
+                    ('Лисий лес', 1, 'Старый лис', 1.0, 2, 3, FALSE, 0.0),
+                    ('Лисий лес', 1, 'Молодой лис', 0.85, 1, 2, TRUE, 0.06),
+                    ('Лисий лес', 1, 'Матерый лис', 0.45, 1, 1, TRUE, 0.10),
+                    ('Лисий лес', 1, 'Лисий вожак', 0.15, 1, 1, TRUE, 0.14),
+                    ('Логово Волков', 1, 'Старый волк', 1.0, 2, 4, FALSE, 0.0),
+                    ('Логово Волков', 1, 'Молодой волк', 0.85, 2, 3, TRUE, 0.06),
+                    ('Логово Волков', 1, 'Матерый волк', 0.55, 1, 2, TRUE, 0.10),
+                    ('Логово Волков', 1, 'Вожак волков', 0.20, 1, 1, TRUE, 0.15),
+                    ('Подземелье: Канализация Ауриса', 1, 'Канализационный карманник', 1.0, 2, 3, FALSE, 0.0),
+                    ('Подземелье: Канализация Ауриса', 1, 'Канализационный налетчик', 0.9, 2, 3, TRUE, 0.08),
+                    ('Подземелье: Канализация Ауриса', 1, 'Канализационный головорез', 0.65, 1, 2, TRUE, 0.12),
+                    ('Подземелье: Канализация Ауриса', 1, 'Канализационный вышибала', 0.55, 1, 2, TRUE, 0.12),
+                    ('Подземелье: Канализация Ауриса', 1, 'Главарь канализационной банды', 0.20, 1, 1, TRUE, 0.20)
             ) AS v(zone_name, location_id, mob_name, spawn_chance, min_count, max_count, is_champion_spawn, champion_chance)
             JOIN mob_spawn_zones z ON z.zone_name = v.zone_name AND z.location_id = v.location_id
             JOIN mobs m ON m.name = v.mob_name AND m.location_id = v.location_id
@@ -953,6 +1317,36 @@ async def lifespan(app: FastAPI):
                 SELECT 1 FROM mob_zone_spawns s
                 WHERE s.spawn_zone_id = z.id AND s.mob_id = m.id
             )
+            """
+        )
+
+        # Keep fox forest and sewer dungeon spawn pools strictly canonical.
+        execute(
+            """
+            DELETE FROM mob_zone_spawns s
+            USING mob_spawn_zones z, mobs m
+            WHERE s.spawn_zone_id = z.id
+              AND s.mob_id = m.id
+              AND z.location_id = 1
+              AND z.zone_name = 'Лисий лес'
+              AND m.name NOT IN ('Старый лис', 'Молодой лис', 'Матерый лис', 'Лисий вожак')
+            """
+        )
+        execute(
+            """
+            DELETE FROM mob_zone_spawns s
+            USING mob_spawn_zones z, mobs m
+            WHERE s.spawn_zone_id = z.id
+              AND s.mob_id = m.id
+              AND z.location_id = 1
+              AND z.zone_name = 'Подземелье: Канализация Ауриса'
+              AND m.name NOT IN (
+                  'Канализационный карманник',
+                  'Канализационный налетчик',
+                  'Канализационный головорез',
+                  'Канализационный вышибала',
+                  'Главарь канализационной банды'
+              )
             """
         )
         
@@ -1516,6 +1910,14 @@ async def lifespan(app: FastAPI):
                   SELECT 1 FROM quests q
                   WHERE q.npc_id = n.id AND q.title = 'Охота на кроликов'
               )
+        """)
+        execute("""
+            INSERT INTO npcs (location_id, name, type, level, health_points, max_health_points, description, has_quest, position_x, position_y, distance_from_center)
+            SELECT 1, 'Смотритель Равнин Орен', 'quest_giver', 10, 180, 180,
+                   'Смотритель, выдающий ежедневные задания на территории равнин.', TRUE, 22, 14, 26
+            WHERE NOT EXISTS (
+                SELECT 1 FROM npcs WHERE name = 'Смотритель Равнин Орен'
+            )
         """)
         execute("""
             INSERT INTO quests (npc_id, title, description, quest_type, level_requirement, reward_experience, reward_gold, is_available)

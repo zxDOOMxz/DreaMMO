@@ -35,5 +35,8 @@ export function resolveItemIcon(itemName = '', iconsIndex = {}) {
   if (normalized === 'учебный меч') {
     return '/icons/items/Weapon/One handed sword/start_sword.png';
   }
+  if (normalized === 'учебный двуручный меч') {
+    return '/icons/items/Weapon/Two handed sword/2h_sword_1.png';
+  }
   return iconsIndex?.items?.[itemName] || '';
 }

@@ -7,8 +7,37 @@ from database.connection import fetch_all, fetch_one, execute, fetch_val
 from datetime import datetime, timedelta
 import math
 from security import ensure_character_owner, get_current_user_id
+from mob_population import get_zone_mob_entries, restore_zone_if_fully_dead
+from oren_daily_quests import ensure_oren_daily_quests_for_npc
 
 positioning_router = APIRouter()
+
+
+def _filter_fox_forest_mobs(rows: list[dict]) -> list[dict]:
+    """Keep only canonical fox mobs and collapse duplicates by best alive candidate."""
+    targets = ["старый лис", "молодой лис", "матерый лис", "лисий вожак"]
+
+    def _match_target(name: str) -> str | None:
+        normalized = str(name or "").strip().lower()
+        for t in targets:
+            if t in normalized:
+                return t
+        return None
+
+    best_by_target = {}
+    for row in rows:
+        target_key = _match_target(row.get("name"))
+        if not target_key:
+            continue
+        current = best_by_target.get(target_key)
+        row_alive = int(row.get("alive_count") or 0)
+        cur_alive = int(current.get("alive_count") or 0) if current else -1
+        row_level = int(row.get("level") or 0)
+        cur_level = int(current.get("level") or 0) if current else -1
+        if current is None or row_alive > cur_alive or (row_alive == cur_alive and row_level > cur_level):
+            best_by_target[target_key] = row
+
+    return [best_by_target[t] for t in targets if t in best_by_target]
 
 VENDOR_ITEM_NAMES = [
     'Роба ученика',
@@ -31,6 +60,13 @@ VENDOR_ITEM_NAMES = [
     'Волчья шкура',
     'Зуб волка',
 ]
+
+
+def _normalize_target_type(target_type: str) -> str:
+    normalized = (target_type or "").strip().lower()
+    if normalized in {"subzone", "area", "zone"}:
+        return "zone"
+    return normalized
 
 
 def _inventory_add(character_id: int, item_id: int, quantity: int) -> None:
@@ -82,8 +118,9 @@ def _inventory_remove_from_bag(character_id: int, item_id: int, quantity: int) -
 
 # ===== POSITIONING AND ZONES API =====
 
+@positioning_router.get("/world/subzones/{location_id}")
 @positioning_router.get("/world/zones/{location_id}")
-async def get_location_zones(location_id: int, character_id: int, current_user_id: int = Depends(get_current_user_id)):
+async def get_location_zones(location_id: int, character_id: int, include_mobs: bool = True, current_user_id: int = Depends(get_current_user_id)):
     """
     Get all zones and objects in a location with distances
     Returns table-style data for UI display
@@ -93,14 +130,17 @@ async def get_location_zones(location_id: int, character_id: int, current_user_i
 
         # Get character current position
         char = fetch_one("""
-            SELECT current_location_id, position_x, position_y, COALESCE(position_z, 0), level
+            SELECT current_location_id, current_zone_id, position_x, position_y, COALESCE(position_z, 0), level
             FROM characters WHERE id = %s
         """, character_id)
         
         if not char:
             raise HTTPException(status_code=404, detail="Character not found")
         
-        char_location_id, char_x, char_y, char_z, char_level = char
+        char_location_id, char_zone_id, char_x, char_y, char_z, char_level = char
+        char_zone_type = None
+        if char_zone_id:
+            char_zone_type = str(fetch_val("SELECT zone_type FROM mob_spawn_zones WHERE id = %s", char_zone_id) or "").lower()
         
         # Update character location if not set
         if not char_location_id:
@@ -110,8 +150,29 @@ async def get_location_zones(location_id: int, character_id: int, current_user_i
             char_y = 0
             char_z = 0
         
-        # Get mob spawn zones with distances
-        zones = fetch_all("""
+        location_info_row = fetch_one("SELECT name, location_type FROM locations WHERE id = %s", location_id)
+        location_name = (location_info_row[0] or "") if location_info_row else ""
+        location_type = (location_info_row[1] or "") if location_info_row else ""
+
+        current_zone_center_distance = None
+        if char_zone_id:
+            current_zone_center_distance = fetch_val(
+                "SELECT distance_from_center FROM mob_spawn_zones WHERE id = %s",
+                char_zone_id,
+            )
+
+        def _compute_distance(target_x, target_y, target_z, target_center_distance):
+            tx, ty, tz = float(target_x or 0), float(target_y or 0), float(target_z or 0)
+            # Prefer 3D distance when coordinates are populated.
+            if (tx, ty, tz) != (0.0, 0.0, 0.0):
+                return math.sqrt((tx - char_x) ** 2 + (ty - char_y) ** 2 + (tz - char_z) ** 2)
+            # Fallback for legacy maps where coordinates are not populated.
+            if current_zone_center_distance is not None and target_center_distance is not None:
+                return abs(float(target_center_distance or 0) - float(current_zone_center_distance or 0))
+            return float(target_center_distance or 0)
+
+        # Get subzones (areas) with distances.
+        subzone_rows = fetch_all("""
                         SELECT z.id, z.zone_name, z.zone_type, z.distance_from_center, z.position_x, z.position_y, COALESCE(z.position_z, 0),
                    z.min_level, z.max_level, z.is_aggressive_zone, z.max_mobs
             FROM mob_spawn_zones z
@@ -120,44 +181,47 @@ async def get_location_zones(location_id: int, character_id: int, current_user_i
             ORDER BY z.distance_from_center
         """, location_id)
         
-        zone_list = []
-        seen_zone_names = set()
-        for z in zones:
-            zone_id, name, ztype, distance, zx, zy, zz, min_lvl, max_lvl, is_aggr, max_mobs = z
-            normalized_zone_name = (name or "").strip().lower()
-            if normalized_zone_name in seen_zone_names:
+        subzone_entries = []
+        seen_subzone_names = set()
+        for subzone_row in subzone_rows:
+            zone_id, name, ztype, distance, zx, zy, zz, min_lvl, max_lvl, is_aggr, max_mobs = subzone_row
+            normalized_subzone_name = (name or "").strip().lower()
+            if normalized_subzone_name in seen_subzone_names:
                 continue
-            seen_zone_names.add(normalized_zone_name)
+            seen_subzone_names.add(normalized_subzone_name)
             
             # Calculate actual distance from character to zone
-            actual_distance = math.sqrt((zx - char_x) ** 2 + (zy - char_y) ** 2 + (zz - char_z) ** 2) if (zx, zy, zz) != (0, 0, 0) else distance
-            
-            # Get mobs in this zone
-            mobs_in_zone = fetch_all("""
-                SELECT m.id, m.name, m.level, m.aggression_type, m.is_champion, m.champion_stars
-                FROM mob_zone_spawns mzs
-                JOIN mobs m ON m.id = mzs.mob_id
-                WHERE mzs.spawn_zone_id = %s
-            """, zone_id)
+            actual_distance = _compute_distance(zx, zy, zz, distance)
             
             mob_details = []
-            for mob in mobs_in_zone:
-                mob_id, mob_name, mob_lvl, aggr, is_champ, stars = mob
-                aggr_display = "АГР" if aggr == "aggressive" else "ПАС"
-                champ_display = "*" * (stars or 0) if is_champ else ""
-                mob_details.append({
-                    "id": mob_id,
-                    "name": f"{mob_name} {champ_display}".strip(),
-                    "level": mob_lvl,
-                    "aggression": aggr_display,
-                    "is_champion": is_champ,
-                    "stars": stars or 0
-                })
+            if include_mobs:
+                mobs_in_zone = fetch_all("""
+                    SELECT m.id, m.name, m.level, m.aggression_type, m.is_champion, m.champion_stars
+                    FROM mob_zone_spawns mzs
+                    JOIN mobs m ON m.id = mzs.mob_id
+                    WHERE mzs.spawn_zone_id = %s
+                """, zone_id)
+                for mob in mobs_in_zone:
+                    mob_id, mob_name, mob_lvl, aggr, is_champ, stars = mob
+                    aggr_display = "АГР" if aggr == "aggressive" else "ПАС"
+                    champ_display = "*" * (stars or 0) if is_champ else ""
+                    mob_details.append({
+                        "id": mob_id,
+                        "name": f"{mob_name} {champ_display}".strip(),
+                        "level": mob_lvl,
+                        "aggression": aggr_display,
+                        "is_champion": is_champ,
+                        "stars": stars or 0
+                    })
             
-            zone_list.append({
+            subzone_entries.append({
                 "zone_id": zone_id,
                 "name": name,
                 "type": ztype,
+                "subzone_id": zone_id,
+                "subzone_name": name,
+                "area_name": name,
+                "parent_zone_name": location_name,
                 "distance": round(actual_distance, 1),
                 "position": {"x": float(zx or 0), "y": float(zy or 0), "z": float(zz or 0)},
                 "level_range": f"{min_lvl}-{max_lvl}",
@@ -166,10 +230,7 @@ async def get_location_zones(location_id: int, character_id: int, current_user_i
                 "can_interact": actual_distance <= 10  # 10 meter interaction range
             })
         
-        location_type_row = fetch_one("SELECT location_type FROM locations WHERE id = %s", location_id)
-        location_type = (location_type_row[0] or "") if location_type_row else ""
-
-        existing_types = {str(zone.get("type") or "").lower() for zone in zone_list}
+        existing_types = {str(zone.get("type") or "").lower() for zone in subzone_entries}
         missing_types = [ztype for ztype in ("hunting", "resource") if ztype not in existing_types]
 
         # In city hubs, expose at least one hunting/resource destination zone from connected world locations.
@@ -197,16 +258,20 @@ async def get_location_zones(location_id: int, character_id: int, current_user_i
                 if zone_type in added_types:
                     continue
                 composed_name = f"{zone_name} ({loc_name})"
-                if composed_name.strip().lower() in seen_zone_names:
+                if composed_name.strip().lower() in seen_subzone_names:
                     continue
                 added_types.add(zone_type)
-                seen_zone_names.add(composed_name.strip().lower())
-                actual_distance = math.sqrt((zx - char_x) ** 2 + (zy - char_y) ** 2 + (zz - char_z) ** 2)
-                zone_list.append(
+                seen_subzone_names.add(composed_name.strip().lower())
+                actual_distance = _compute_distance(zx, zy, zz, base_distance)
+                subzone_entries.append(
                     {
                         "zone_id": zone_id,
                         "name": composed_name,
                         "type": zone_type,
+                        "subzone_id": zone_id,
+                        "subzone_name": zone_name,
+                        "area_name": zone_name,
+                        "parent_zone_name": loc_name,
                         "distance": round(actual_distance, 1),
                         "position": {"x": float(zx or 0), "y": float(zy or 0), "z": float(zz or 0)},
                         "level_range": f"{min_lvl}-{max_lvl}",
@@ -218,9 +283,56 @@ async def get_location_zones(location_id: int, character_id: int, current_user_i
                 if len(added_types) == len(missing_types):
                     break
 
-        # NPCs are intentionally visible only in city locations.
+        existing_types = {str(zone.get("type") or "").lower() for zone in subzone_entries}
+        has_city_destination = "city" in existing_types
+        if not has_city_destination and location_type not in {"city", "town", "hub"}:
+            city_rows = fetch_all(
+                """
+                SELECT z.id, z.zone_name, z.zone_type, z.distance_from_center,
+                       z.position_x, z.position_y, COALESCE(z.position_z, 0),
+                       z.min_level, z.max_level, z.is_aggressive_zone, z.max_mobs,
+                       l.name
+                FROM mob_spawn_zones z
+                JOIN locations l ON l.id = z.location_id
+                WHERE z.location_id <> %s
+                  AND z.zone_type = 'city'
+                ORDER BY z.distance_from_center ASC
+                """,
+                location_id,
+            )
+
+            for row in city_rows:
+                zone_id, zone_name, zone_type, base_distance, zx, zy, zz, min_lvl, max_lvl, is_aggr, max_mobs, loc_name = row
+                composed_name = f"{zone_name} ({loc_name})"
+                normalized_name = composed_name.strip().lower()
+                if normalized_name in seen_subzone_names:
+                    continue
+                seen_subzone_names.add(normalized_name)
+                actual_distance = _compute_distance(zx, zy, zz, base_distance)
+                subzone_entries.append(
+                    {
+                        "zone_id": zone_id,
+                        "name": composed_name,
+                        "type": "city",
+                        "subzone_id": zone_id,
+                        "subzone_name": zone_name,
+                        "area_name": zone_name,
+                        "parent_zone_name": loc_name,
+                        "distance": round(actual_distance, 1),
+                        "position": {"x": float(zx or 0), "y": float(zy or 0), "z": float(zz or 0)},
+                        "level_range": f"{min_lvl}-{max_lvl}",
+                        "is_aggressive": bool(is_aggr),
+                        "mobs": [],
+                        "can_interact": actual_distance <= 10,
+                    }
+                )
+                break
+
+        has_city_subzones = any(str(zone.get("type") or "").lower() == "city" for zone in subzone_entries)
+
+        # NPCs are visible in explicit city maps and in maps that contain city subzones.
         npcs = []
-        if location_type in {"city", "town", "hub"}:
+        if location_type in {"city", "town", "hub"} or has_city_subzones:
             npcs = fetch_all("""
                 SELECT id, name, type, level, description, distance_from_center, position_x, position_y, COALESCE(position_z, 0)
                 FROM npcs
@@ -237,6 +349,11 @@ async def get_location_zones(location_id: int, character_id: int, current_user_i
                 continue
             seen_npc_names.add(normalized_npc_name)
             actual_distance = math.sqrt((nx - char_x) ** 2 + (ny - char_y) ** 2 + (nz - char_z) ** 2) if (nx, ny, nz) != (0, 0, 0) else distance
+            city_auto_interact = (
+                char_location_id == location_id
+                and char_zone_type == "city"
+                and ntype in {"quest_giver", "merchant", "broker", "crafting_station"}
+            )
             
             interaction_options = []
             if ntype == "quest_giver":
@@ -253,17 +370,54 @@ async def get_location_zones(location_id: int, character_id: int, current_user_i
                 "name": name,
                 "type": ntype,
                 "level": lvl,
-                "distance": round(actual_distance, 1),
+                "distance": 0 if city_auto_interact else round(actual_distance, 1),
                 "position": {"x": float(nx or 0), "y": float(ny or 0), "z": float(nz or 0)},
-                "can_interact": actual_distance <= 10,
+                "can_interact": True if city_auto_interact else actual_distance <= 10,
                 "interaction_options": interaction_options
             })
+
+        # Canonical strict 3-area structure for frontend rendering.
+        area_groups = {"city": [], "hunting": [], "resource": []}
+        for zone in subzone_entries:
+            zone_type = str(zone.get("type") or "").lower()
+            if zone_type == "city":
+                area_groups["city"].append(zone)
+            elif zone_type in {"hunting", "pack"}:
+                area_groups["hunting"].append(zone)
+            elif zone_type in {"resource", "mining"}:
+                area_groups["resource"].append(zone)
+
+        city_stations = [npc for npc in npc_list if str(npc.get("type") or "").lower() == "crafting_station"]
+        city_npcs = [npc for npc in npc_list if str(npc.get("type") or "").lower() != "crafting_station"]
         
+        nearest_city_distance = None
+        city_distances = [
+            float(zone.get("distance") or 0)
+            for zone in subzone_entries
+            if str(zone.get("type") or "").lower() == "city"
+        ]
+        if city_distances:
+            # Outside city, prefer meaningful positive distances and avoid misleading 0.0 artifacts.
+            if char_zone_type != "city":
+                positive = [d for d in city_distances if d > 0]
+                nearest_city_distance = round(min(positive), 1) if positive else round(min(city_distances), 1)
+            else:
+                nearest_city_distance = round(min(city_distances), 1)
+
         return {
             "location_id": location_id,
             "character_position": {"x": char_x, "y": char_y, "z": char_z},
-            "zones": zone_list,
-            "npcs": npc_list
+            # New canonical naming; keep legacy `zones` for compatibility.
+            "subzones": subzone_entries,
+            "zones": subzone_entries,
+            "npcs": npc_list,
+            # Canonical grouped world model: exactly 3 area buckets.
+            "areas": area_groups,
+            "city": {
+                "stations": city_stations,
+                "npcs": city_npcs,
+            },
+            "nearest_city_distance_m": nearest_city_distance,
         }
     except HTTPException:
         raise
@@ -274,26 +428,28 @@ async def get_location_zones(location_id: int, character_id: int, current_user_i
 @positioning_router.post("/world/move/{character_id}")
 async def start_movement(character_id: int, target_type: str, target_id: int, current_user_id: int = Depends(get_current_user_id)):
     """
-    Start moving character towards a target (zone, npc, mob)
-    target_type: 'zone', 'npc', 'mob'
+    Start moving character towards a target (subzone/area, npc, mob)
+    target_type: 'zone'|'subzone'|'area', 'npc', 'mob'
     """
     try:
         ensure_character_owner(character_id, current_user_id)
 
         char = fetch_one("""
-            SELECT id, position_x, position_y, COALESCE(position_z, 0), movement_speed, is_moving
+            SELECT id, position_x, position_y, COALESCE(position_z, 0), movement_speed, is_moving, current_zone_id
             FROM characters WHERE id = %s
         """, character_id)
         
         if not char:
             raise HTTPException(status_code=404, detail="Character not found")
         
-        char_id, char_x, char_y, char_z, speed, is_moving = char
+        char_id, char_x, char_y, char_z, speed, is_moving, current_zone_id = char
         
+        normalized_target_type = _normalize_target_type(target_type)
+
         # Get target position
         target_x, target_y, target_z, target_name = None, None, None, None
         
-        if target_type == "zone":
+        if normalized_target_type == "zone":
             target = fetch_one("""
                 SELECT position_x, position_y, COALESCE(position_z, 0), zone_name
                 FROM mob_spawn_zones WHERE id = %s
@@ -301,7 +457,7 @@ async def start_movement(character_id: int, target_type: str, target_id: int, cu
             if target:
                 target_x, target_y, target_z, target_name = target
                 
-        elif target_type == "npc":
+        elif normalized_target_type == "npc":
             target = fetch_one("""
                 SELECT position_x, position_y, COALESCE(position_z, 0), name
                 FROM npcs WHERE id = %s
@@ -309,7 +465,7 @@ async def start_movement(character_id: int, target_type: str, target_id: int, cu
             if target:
                 target_x, target_y, target_z, target_name = target
                 
-        elif target_type == "mob":
+        elif normalized_target_type == "mob":
             target = fetch_one("""
                 SELECT position_x, position_y, COALESCE(position_z, 0), name
                 FROM mobs WHERE id = %s
@@ -324,15 +480,27 @@ async def start_movement(character_id: int, target_type: str, target_id: int, cu
         distance = math.sqrt((target_x - char_x) ** 2 + (target_y - char_y) ** 2 + (target_z - char_z) ** 2)
         
         # Update character movement state
-        execute("""
-            UPDATE characters 
-            SET target_object_id = %s, 
-                target_object_type = %s,
-                distance_to_target = %s,
-                is_moving = TRUE,
-                last_position_update = NOW()
-            WHERE id = %s
-        """, target_id, target_type, distance, character_id)
+        if normalized_target_type == "zone" and current_zone_id and int(current_zone_id) != int(target_id):
+            execute("""
+                UPDATE characters 
+                SET target_object_id = %s, 
+                    target_object_type = %s,
+                    distance_to_target = %s,
+                    is_moving = TRUE,
+                    current_zone_id = NULL,
+                    last_position_update = NOW()
+                WHERE id = %s
+            """, target_id, normalized_target_type, distance, character_id)
+        else:
+            execute("""
+                UPDATE characters 
+                SET target_object_id = %s, 
+                    target_object_type = %s,
+                    distance_to_target = %s,
+                    is_moving = TRUE,
+                    last_position_update = NOW()
+                WHERE id = %s
+            """, target_id, normalized_target_type, distance, character_id)
         
         # Calculate arrival time
         arrival_time = distance / speed if speed > 0 else 0
@@ -340,7 +508,7 @@ async def start_movement(character_id: int, target_type: str, target_id: int, cu
         return {
             "status": "moving",
             "target_name": target_name,
-            "target_type": target_type,
+            "target_type": normalized_target_type,
             "distance": round(distance, 1),
             "speed": speed,
             "eta_seconds": round(arrival_time, 1)
@@ -462,29 +630,57 @@ async def get_movement_status(character_id: int, current_user_id: int = Depends(
 @positioning_router.post("/world/interact/{character_id}")
 async def interact_with_object(character_id: int, target_type: str, target_id: int, action: str, current_user_id: int = Depends(get_current_user_id)):
     """
-    Interact with an object (NPC, zone, mob)
+    Interact with an object (NPC, subzone/area, mob)
     action: 'talk', 'attack', 'gather', 'enter', 'buy', 'sell', 'quest', 'turn_in_quest'
     """
     try:
         ensure_character_owner(character_id, current_user_id)
+        action = str(action or "").strip().lower()
 
         # Check if character is close enough (10 meters)
         char = fetch_one("""
-            SELECT position_x, position_y, COALESCE(position_z, 0) FROM characters WHERE id = %s
+            SELECT position_x, position_y, COALESCE(position_z, 0), current_zone_id
+            FROM characters WHERE id = %s
         """, character_id)
         
         if not char:
             raise HTTPException(status_code=404, detail="Character not found")
         
-        char_x, char_y, char_z = char
+        char_x, char_y, char_z, char_zone_id = char
+        char_location_id = fetch_val("SELECT current_location_id FROM characters WHERE id = %s", character_id)
+        char_zone_type = str(fetch_val("SELECT zone_type FROM mob_spawn_zones WHERE id = %s", char_zone_id) or "").lower() if char_zone_id else ""
         
+        normalized_target_type = _normalize_target_type(target_type)
+
+        # Handle exit early to avoid stale target_id issues from client-side lists.
+        if action in {"exit", "leave", "exit_zone"} and normalized_target_type == "zone":
+            current_zone_id = fetch_val("SELECT current_zone_id FROM characters WHERE id = %s", character_id)
+            if not current_zone_id:
+                return {
+                    "success": False,
+                    "message": "Вы не находитесь в зоне",
+                }
+
+            active_zone_id = int(current_zone_id)
+            zone_name = fetch_val("SELECT zone_name FROM mob_spawn_zones WHERE id = %s", active_zone_id)
+
+            execute("UPDATE characters SET current_zone_id = NULL WHERE id = %s", character_id)
+            return {
+                "success": True,
+                "action": "exit_zone",
+                "zone_id": active_zone_id,
+                "zone_name": zone_name,
+                "message": f"Вы вышли из зоны: {zone_name}",
+                "mobs": [],
+            }
+
         # Get target position and check distance
         target_info = None
-        if target_type == "npc":
+        if normalized_target_type == "npc":
             target_info = fetch_one("""
-                SELECT position_x, position_y, COALESCE(position_z, 0), name, type FROM npcs WHERE id = %s
+                SELECT position_x, position_y, COALESCE(position_z, 0), name, type, location_id FROM npcs WHERE id = %s
             """, target_id)
-        elif target_type == "zone":
+        elif normalized_target_type == "zone":
             target_info = fetch_one("""
                 SELECT position_x, position_y, COALESCE(position_z, 0), zone_name, zone_type FROM mob_spawn_zones WHERE id = %s
             """, target_id)
@@ -492,17 +688,29 @@ async def interact_with_object(character_id: int, target_type: str, target_id: i
         if not target_info:
             raise HTTPException(status_code=404, detail="Target not found")
         
-        target_x, target_y, target_z, target_name, target_subtype = target_info
+        target_x, target_y, target_z, target_name, target_subtype = target_info[:5]
         distance = math.sqrt((target_x - char_x) ** 2 + (target_y - char_y) ** 2 + (target_z - char_z) ** 2)
+
+        bypass_city_distance = False
+        if normalized_target_type == "npc" and len(target_info) >= 6:
+            target_location_id = target_info[5]
+            bypass_city_distance = (
+                target_subtype in {"quest_giver", "merchant", "broker", "crafting_station"}
+                and char_location_id == target_location_id
+                and char_zone_type == "city"
+                and action in {"quest", "turn_in_quest", "buy", "sell", "auction", "craft"}
+            )
         
-        if distance > 10:
+        skip_zone_distance_check = normalized_target_type == "zone" and action in {"enter", "exit", "leave", "exit_zone"}
+        if distance > 10 and not bypass_city_distance and not skip_zone_distance_check:
             return {
                 "success": False,
                 "message": f"Слишком далеко! Расстояние: {round(distance, 1)}м. Подойдите ближе (макс. 10м)"
             }
         
         # Handle different actions
-        if action == "quest" and target_type == "npc":
+        if action == "quest" and normalized_target_type == "npc":
+            ensure_oren_daily_quests_for_npc(int(target_id))
             # Return available quests from this NPC
             quests = fetch_all("""
                 SELECT q.id, q.title, q.description, q.level_requirement
@@ -521,7 +729,7 @@ async def interact_with_object(character_id: int, target_type: str, target_id: i
                 "quests": [{"id": q[0], "title": q[1], "description": q[2], "required_level": q[3]} for q in quests]
             }
 
-        elif action == "craft" and target_type == "npc":
+        elif action == "craft" and normalized_target_type == "npc":
             recipes_count = fetch_val("SELECT COUNT(*) FROM crafting_recipes") or 0
             return {
                 "success": True,
@@ -530,7 +738,7 @@ async def interact_with_object(character_id: int, target_type: str, target_id: i
                 "message": f"Открыт крафтовый станок: {target_name}. Доступно рецептов: {int(recipes_count)}"
             }
         
-        elif action == "turn_in_quest" and target_type == "npc":
+        elif action == "turn_in_quest" and normalized_target_type == "npc":
             # Get completed quests for this NPC
             completed = fetch_all("""
                 SELECT cq.quest_id, q.title, q.gold_reward, q.experience_reward
@@ -546,7 +754,7 @@ async def interact_with_object(character_id: int, target_type: str, target_id: i
                 "quests": [{"id": q[0], "title": q[1], "gold_reward": q[2], "exp_reward": q[3]} for q in completed]
             }
         
-        elif action == "buy" and target_type == "npc":
+        elif action == "buy" and normalized_target_type == "npc":
             starter_goods = fetch_all(
                 """
                 SELECT id, name, item_type, rarity, COALESCE(value, 0), COALESCE(description, '')
@@ -579,7 +787,7 @@ async def interact_with_object(character_id: int, target_type: str, target_id: i
                 ],
             }
         
-        elif action == "sell" and target_type == "npc":
+        elif action == "sell" and normalized_target_type == "npc":
             sell_rows = fetch_all(
                 """
                 SELECT i.id, i.name, i.item_type, i.rarity, COALESCE(i.value, 0),
@@ -614,7 +822,7 @@ async def interact_with_object(character_id: int, target_type: str, target_id: i
                 ],
             }
         
-        elif action == "auction" and target_type == "npc":
+        elif action == "auction" and normalized_target_type == "npc":
             return {
                 "success": True,
                 "action": "auction",
@@ -622,7 +830,7 @@ async def interact_with_object(character_id: int, target_type: str, target_id: i
                 "message": "Открыт аукцион (функционал в разработке)"
             }
         
-        elif action == "enter" and target_type == "zone":
+        elif action == "enter" and normalized_target_type == "zone":
             zone_info = fetch_one(
                 "SELECT id, location_id, zone_name, position_x, position_y, COALESCE(position_z, 0) FROM mob_spawn_zones WHERE id = %s",
                 target_id,
@@ -650,18 +858,10 @@ async def interact_with_object(character_id: int, target_type: str, target_id: i
                 character_id,
             )
 
-            zone_mobs = fetch_all(
-                """
-                SELECT m.id, m.name, m.level, m.health_points, m.max_health_points,
-                       m.damage_min, m.damage_max, m.aggression_type
-                FROM mob_zone_spawns mzs
-                JOIN mobs m ON m.id = mzs.mob_id
-                WHERE mzs.spawn_zone_id = %s
-                  AND m.health_points > 0
-                ORDER BY m.level ASC, m.name ASC
-                """,
-                zone_id,
-            )
+            restore_zone_if_fully_dead(int(zone_id))
+            zone_mobs = get_zone_mob_entries(int(zone_id), int(zone_location_id))
+            if "лисий лес" in str(zone_name or "").lower():
+                zone_mobs = _filter_fox_forest_mobs(zone_mobs)
 
             return {
                 "success": True,
@@ -670,21 +870,9 @@ async def interact_with_object(character_id: int, target_type: str, target_id: i
                 "location_id": zone_location_id,
                 "zone_name": zone_name,
                 "message": f"Вы вошли в зону: {zone_name}",
-                "mobs": [
-                    {
-                        "id": row[0],
-                        "name": row[1],
-                        "level": row[2],
-                        "health": row[3],
-                        "max_health": row[4],
-                        "damage_min": row[5],
-                        "damage_max": row[6],
-                        "aggression": row[7],
-                    }
-                    for row in zone_mobs
-                ],
+                "mobs": zone_mobs,
             }
-        
+
         else:
             return {
                 "success": False,

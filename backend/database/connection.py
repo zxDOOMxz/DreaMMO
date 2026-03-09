@@ -48,7 +48,7 @@ async def close_db_pool():
     
     if _db_pool is not None:
         _db_pool.closeall()
-        print("🔌 База данных отключена")
+        print("[INFO] База данных отключена")
         _db_pool = None
 
 
